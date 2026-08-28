@@ -5,6 +5,11 @@ FFmpeg's software H.264 decoder with Vita-tuned pthread workers; AAC output uses
 the public Vita audio decoder. It never loads ReAvPlayer and never selects
 `h264_vita`.
 
+<p align="center">
+  <img src="screenshots/software-decoder.jpeg" alt="Software H.264 decoding on PlayStation Vita">
+</p>
+<p align="center"><sub>FFmpeg software H.264 playback on PlayStation Vita</sub></p>
+
 ## Integrate in three steps
 
 ```sh
