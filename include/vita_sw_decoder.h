@@ -46,6 +46,7 @@ typedef struct VitaSwDecoderPlayerStatus {
 	int fps;
 	uint32_t width;
 	uint32_t height;
+	uint64_t video_bitrate_bps;
 	uint64_t position_ms;
 	uint64_t duration_ms;
 	unsigned int frames_decoded;

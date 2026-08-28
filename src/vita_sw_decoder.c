@@ -40,9 +40,11 @@ struct VitaSwDecoderPlayer {
 	int opened;
 	int paused;
 	uint64_t duration_ms;
+	uint64_t video_bitrate_bps;
 	uint64_t clock_us;
 	uint64_t clock_wall_us;
 	int clock_started;
+	int has_audio;
 };
 
 int vita_sw_decoder_prepare_runtime(void) {
@@ -175,41 +177,56 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	player->clock_us = 0;
 	player->clock_wall_us = 0;
 	player->clock_started = 0;
+	player->has_audio = 0;
+	player->video_bitrate_bps = 0;
 	memset(&player->video, 0, sizeof(player->video));
 	memset(&player->audio, 0, sizeof(player->audio));
 
 	int ret = input_open(&player->video_input, &player->config.stream,
 	                     player->cancel);
 	if (ret < 0) goto fail;
-	ret = input_open(&player->audio_input, &player->config.stream,
-	                 player->cancel);
-	if (ret < 0) goto fail;
-
 	int video_index = find_stream(player->video_input.format,
 	                              AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264);
-	int audio_index = find_stream(player->audio_input.format,
+	int audio_index = find_stream(player->video_input.format,
 	                              AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
-	if (video_index < 0 || audio_index < 0) {
+	if (video_index < 0) {
 		ret = AVERROR_DECODER_NOT_FOUND;
 		goto fail;
 	}
+	AVCodecParameters *video_parameters =
+	    player->video_input.format->streams[video_index]->codecpar;
+	if (video_parameters->bit_rate > 0)
+		player->video_bitrate_bps = (uint64_t)video_parameters->bit_rate;
+	else if (player->video_input.format->bit_rate > 0)
+		player->video_bitrate_bps = (uint64_t)player->video_input.format->bit_rate;
+	if (audio_index >= 0) {
+		ret = input_open(&player->audio_input, &player->config.stream,
+		                 player->cancel);
+		if (ret < 0) goto fail;
+		audio_index = find_stream(player->audio_input.format,
+		                          AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+		if (audio_index < 0) { ret = AVERROR_DECODER_NOT_FOUND; goto fail; }
+		player->has_audio = 1;
+	}
 	player->duration_ms = input_duration_ms(player->video_input.format);
-	if (!player->duration_ms)
+	if (!player->duration_ms && player->has_audio)
 		player->duration_ms = input_duration_ms(player->audio_input.format);
 
 	if (start_position_ms > 0) {
 		AVStream *video_stream = player->video_input.format->streams[video_index];
-		AVStream *audio_stream = player->audio_input.format->streams[audio_index];
 		int64_t video_target = av_rescale_q((int64_t)start_position_ms,
 		                                    (AVRational){ 1, 1000 },
 		                                    video_stream->time_base);
-		int64_t audio_target = av_rescale_q((int64_t)start_position_ms,
-		                                    (AVRational){ 1, 1000 },
-		                                    audio_stream->time_base);
 		av_seek_frame(player->video_input.format, video_index, video_target,
 		              AVSEEK_FLAG_BACKWARD);
-		av_seek_frame(player->audio_input.format, audio_index, audio_target,
-		              AVSEEK_FLAG_BACKWARD);
+		if (player->has_audio) {
+			AVStream *audio_stream = player->audio_input.format->streams[audio_index];
+			int64_t audio_target = av_rescale_q((int64_t)start_position_ms,
+			                                    (AVRational){ 1, 1000 },
+			                                    audio_stream->time_base);
+			av_seek_frame(player->audio_input.format, audio_index, audio_target,
+			              AVSEEK_FLAG_BACKWARD);
+		}
 	}
 
 	ret = vita_sw_software_video_start(&player->video, player->video_input.format,
@@ -218,12 +235,16 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	                           player->config.expected_fps, start_position_ms,
 	                           player->cancel, &player->start_gate);
 	if (ret < 0) goto fail;
-	ret = vita_sw_elementary_audio_start(&player->audio, player->audio_input.format,
-	                            audio_index, start_position_ms,
-	                            player->cancel, &player->start_gate);
-	if (ret < 0) goto fail;
-	vita_sw_elementary_audio_set_volume(&player->audio, player->config.volume_percent);
-	player->audio.paused = player->paused;
+	if (player->has_audio) {
+		ret = vita_sw_elementary_audio_start(&player->audio,
+		                            player->audio_input.format, audio_index,
+		                            start_position_ms, player->cancel,
+		                            &player->start_gate);
+		if (ret < 0) goto fail;
+		vita_sw_elementary_audio_set_volume(&player->audio,
+		                                    player->config.volume_percent);
+		player->audio.paused = player->paused;
+	} else player->clock_us = start_position_ms * 1000ULL;
 	/* Video is allowed to decode while audio waits on the start gate. A small
 	 * presentation cushion prevents the audio clock from outrunning the first
 	 * remote frames without adding a fixed startup delay. */
@@ -303,6 +324,17 @@ int vita_sw_decoder_seek(VitaSwDecoderPlayer *player, uint64_t position_ms) {
 
 static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
 	uint64_t now = sceKernelGetProcessTimeWide();
+	if (!player->has_audio) {
+		if (!player->clock_started) {
+			player->clock_started = 1;
+			player->clock_wall_us = now;
+			return player->clock_us;
+		}
+		uint64_t delta = now - player->clock_wall_us;
+		player->clock_wall_us = now;
+		if (!player->paused) player->clock_us += delta;
+		return player->clock_us;
+	}
 	uint64_t raw = vita_sw_elementary_audio_clock_us(&player->audio);
 	if (!raw) return 0;
 	if (!player->clock_started) {
@@ -324,8 +356,10 @@ static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
 
 int vita_sw_decoder_present(VitaSwDecoderPlayer *player, int fill_screen) {
 	if (!player || !player->opened) return 0;
-	uint64_t raw = vita_sw_elementary_audio_clock_us(&player->audio);
-	return vita_sw_software_video_present(&player->video, presentation_clock(player), raw,
+	uint64_t clock = presentation_clock(player);
+	uint64_t raw = player->has_audio
+	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
+	return vita_sw_software_video_present(&player->video, clock, raw,
 	                              fill_screen, !player->paused);
 }
 
@@ -333,9 +367,11 @@ int vita_sw_decoder_present_rect(VitaSwDecoderPlayer *player,
 	                            float x, float y, float width, float height,
 	                            int fill_rect) {
 	if (!player || !player->opened) return 0;
-	uint64_t raw = vita_sw_elementary_audio_clock_us(&player->audio);
+	uint64_t clock = presentation_clock(player);
+	uint64_t raw = player->has_audio
+	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
 	return vita_sw_software_video_present_rect(&player->video,
-	                                   presentation_clock(player), raw,
+	                                   clock, raw,
 	                                   x, y, width, height, fill_rect,
 	                                   !player->paused);
 }
@@ -351,12 +387,17 @@ void vita_sw_decoder_get_status(VitaSwDecoderPlayer *player,
 	if (!player) return;
 	status->opened = player->opened;
 	status->paused = player->paused;
-	status->eof = player->video.eof && player->audio.eof;
-	status->error = player->video.had_error || player->audio.had_error;
+	status->eof = player->video.eof &&
+	              (!player->has_audio || player->audio.eof);
+	status->error = player->video.had_error ||
+	                (player->has_audio && player->audio.had_error);
 	status->width = player->video.content_width;
 	status->height = player->video.content_height;
+	status->video_bitrate_bps = player->video_bitrate_bps;
 	status->duration_ms = player->duration_ms;
-	status->position_ms = vita_sw_elementary_audio_clock_us(&player->audio) / 1000ULL;
+	status->position_ms = (player->has_audio
+	    ? vita_sw_elementary_audio_clock_us(&player->audio)
+	    : player->clock_us) / 1000ULL;
 	SoftwareVideoDebugSnapshot debug;
 	vita_sw_software_video_debug_snapshot(&player->video, &debug);
 	status->hardware_accelerated = debug.hardware_accelerated;

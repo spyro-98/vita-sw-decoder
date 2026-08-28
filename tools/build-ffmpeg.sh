@@ -26,7 +26,7 @@ cd "$work/ffmpeg-${ffmpeg_version}"
   --nm="$VITASDK/bin/arm-vita-eabi-gcc-nm" \
   --disable-shared --enable-static --disable-runtime-cpudetect \
   --disable-programs --disable-doc --disable-network --disable-everything \
-  --enable-decoder=h264 --enable-demuxer=mov,mpegts \
+  --enable-decoder=h264 --enable-demuxer=mov,matroska,mpegts \
   --enable-parser=aac,h264 --enable-protocol=file \
   --disable-debug --enable-hardcoded-tables --enable-lto \
   --arch=armv7-a --cpu=cortex-a9 --target-os=none \

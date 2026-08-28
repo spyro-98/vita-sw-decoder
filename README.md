@@ -1,6 +1,6 @@
 # vita-sw-decoder
 
-Plug-and-play CPU H.264/AAC player backend for PlayStation Vita. Video uses
+Plug-and-play CPU H.264 player backend with optional AAC audio for PlayStation Vita. Video uses
 FFmpeg's software H.264 decoder with Vita-tuned pthread workers; AAC output uses
 the public Vita audio decoder. It never loads ReAvPlayer and never selects
 `h264_vita`.
@@ -37,11 +37,14 @@ contract but have distinct symbols and CMake targets, so they can be linked
 together. An application can try the hardware package first, destroy that
 session on failure, then reopen the same stream factory with
 `vita_sw_decoder_open()`. `vita_sw_decoder_backend_name()` returns `software`.
+`VitaSwDecoderPlayerStatus.video_bitrate_bps` exposes the H.264 stream bitrate
+reported by FFmpeg, with the container bitrate used only when the stream does
+not provide one. A zero value means the source did not advertise a bitrate.
 
 The source factory creates two independent seekable cursors (audio and video).
 It therefore works with local files and with remote Range readers. Supported
 content is a seekable container recognized by the pinned FFmpeg build with
-H.264 video and AAC audio. CPU decoding is deliberately a compatibility path;
+H.264 video with optional AAC audio in a MOV/MP4 or Matroska container. CPU decoding is deliberately a compatibility path;
 resolution and frame-rate limits must be measured on hardware.
 
 ## Install and consume
