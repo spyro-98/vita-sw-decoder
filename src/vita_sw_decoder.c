@@ -298,12 +298,15 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		                                    player->config.volume_percent);
 		player->audio.paused = player->paused;
 	}
-	uint64_t deadline = sceKernelGetProcessTimeWide() + 2000000ULL;
+	/* A seek only needs one decoded frame before releasing audio. Waiting for a
+	 * multi-frame cushion made every interaction feel like a fresh startup on
+	 * the Vita CPU, especially after a distant keyframe seek. */
+	uint64_t deadline = sceKernelGetProcessTimeWide() + 600000ULL;
 	while (!*player->cancel && !player->video.had_error && !player->video.eof &&
 	       sceKernelGetProcessTimeWide() < deadline) {
 		int ready = 0;
 		vita_sw_software_video_buffer_status(&player->video, &ready, NULL, NULL);
-		if (ready >= 2) break;
+		if (ready >= 1) break;
 		sceKernelDelayThread(1000);
 	}
 	if (*player->cancel) return AVERROR_EXIT;

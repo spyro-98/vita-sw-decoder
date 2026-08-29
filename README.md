@@ -48,7 +48,9 @@ The complete render loop is in `examples/local_file.c`.
   counters, and dropped-frame counters are exposed through the public config and
   status structures. Runtime seeks reuse the open demuxers, flush to the target
   keyframe, and rebuild only the decode pipelines; a full reopen remains the
-  recovery fallback.
+  recovery fallback. Audio is released after the first decoded video frame,
+  with seek preroll capped at 600 ms rather than waiting for a multi-frame
+  startup cushion.
 - Stream discovery runs within the configured probe/analyse bounds whenever
   the required H.264/AAC parameters are incomplete, including for indexed MP4
   and Matroska inputs; complete indexed inputs keep the fast path. If an initial
