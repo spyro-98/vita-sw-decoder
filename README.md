@@ -93,7 +93,7 @@ The complete render loop is in `examples/local_file.c`.
   first decoded video frame. Startup
   requires a real picture within a six-second CPU budget rather than publishing
   an audio-only session with an endless Preparing video state. Seek first-frame
-  waits remain capped at 600 ms rather than waiting for a multi-frame cushion.
+  waits use a four-second CPU bound and fail cleanly if no picture is produced.
   If a selected audio stream reaches clean EOF before the
   video, clock ownership moves to the monotonic presentation clock without
   clearing the selected audio pipeline, so position remains continuous, the

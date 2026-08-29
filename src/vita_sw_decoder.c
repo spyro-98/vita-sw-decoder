@@ -1095,7 +1095,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	 * multi-frame cushion made every interaction feel like a fresh startup on
 	 * the Vita CPU, especially after a distant keyframe seek. */
 	uint64_t restarted_us = sceKernelGetProcessTimeWide();
-	uint64_t deadline = restarted_us + 600000ULL;
+	uint64_t deadline = restarted_us + 4000000ULL;
 	int ready = 0;
 	while (!*player->cancel && !player->video.had_error && !player->video.eof &&
 	       sceKernelGetProcessTimeWide() < deadline) {
@@ -1115,6 +1115,11 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		log_printf("decoder seek: stage=first-frame ready=0 ret=%d cause=eof\n",
 		           AVERROR_EOF);
 		return AVERROR_EOF;
+	}
+	if (!ready) {
+		log_printf("decoder seek: stage=first-frame ready=0 ret=%d cause=timeout\n",
+		           AVERROR(ETIMEDOUT));
+		return AVERROR(ETIMEDOUT);
 	}
 	player->start_gate = 1;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
