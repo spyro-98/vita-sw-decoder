@@ -86,10 +86,13 @@ The complete render loop is in `examples/local_file.c`.
   reuse their CDRAM/AVFrame pool without waiting for vita2d on the worker. A
   normal close keeps the conservative render wait, and a full reopen remains
   the recovery fallback for non-cancellation failures. A seek at the reported
-  duration is clamped inside the video-stream end by at least 250 ms so the final GOP cannot be
-  mistaken for a broken empty startup. Audio is released after the first decoded video frame, with both
-  startup and seek first-frame waits capped at 600 ms rather than waiting for a
-  multi-frame cushion. If a selected audio stream reaches clean EOF before the
+  duration is clamped inside the video-stream end by at least 250 ms so the final
+  GOP cannot be mistaken for a broken empty startup. Audio is released after the
+  first decoded video frame. Startup
+  requires a real picture within a six-second CPU budget rather than publishing
+  an audio-only session with an endless Preparing video state. Seek first-frame
+  waits remain capped at 600 ms rather than waiting for a multi-frame cushion.
+  If a selected audio stream reaches clean EOF before the
   video, clock ownership moves to the monotonic presentation clock without
   clearing the selected audio pipeline, so position remains continuous, the
   video tail drains, and a later seek can restart that same track. Hidden or

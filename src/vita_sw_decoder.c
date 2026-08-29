@@ -1247,11 +1247,12 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		                                    player->config.volume_percent);
 		player->audio.paused = player->paused;
 	}
-	/* Video is allowed to decode while audio waits on the start gate. One decoded
-	 * frame is sufficient to leave the modal open path; a short upper bound keeps
-	 * a slow remote source responsive and lets the player show normal buffering. */
+	/* Never publish an audio-only session for a source that is supposed to contain
+	 * H.264 video. CPU startup is allowed a longer bound than hardware, but it must
+	 * either deliver a real picture or fail instead of leaving Preparing video on
+	 * screen forever. */
 	uint64_t gate_started_us = sceKernelGetProcessTimeWide();
-	uint64_t deadline = gate_started_us + 600000ULL;
+	uint64_t deadline = gate_started_us + 6000000ULL;
 	int ready = 0;
 	while (!*player->cancel && !player->video.had_error && !player->video.eof &&
 	       sceKernelGetProcessTimeWide() < deadline) {
@@ -1271,6 +1272,12 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	if (!ready && player->video.eof) {
 		ret = AVERROR_EOF;
 		log_printf("decoder startup: stage=first-frame ready=0 ret=%d cause=eof\n",
+		           ret);
+		goto fail;
+	}
+	if (!ready) {
+		ret = AVERROR(ETIMEDOUT);
+		log_printf("decoder startup: stage=first-frame ready=0 ret=%d cause=timeout\n",
 		           ret);
 		goto fail;
 	}
