@@ -396,6 +396,23 @@ static int publish_frame(SoftwareVideoState *st, const AVFrame *frame) {
 	uint64_t clock_us = st->observed_clock_us;
 	st->frames_decoded++;
 	st->last_decoded_pts_us = pts_us;
+	/* A backward demux seek starts at the preceding random-access picture. Feed
+	 * that picture and its dependent AUs to H.264 so it can reconstruct the
+	 * requested image, but keep decoded preroll out of the presentation ring.
+	 * Dropping the compressed keyframe instead leaves the codec without its
+	 * reference state and produces audio-only playback after a backward seek. */
+	uint64_t requested_us = st->initial_position_ms * 1000ULL;
+	if (requested_us > 0 && pts_us < requested_us) {
+		st->frames_dropped++;
+		slots_unlock(st);
+		return 0;
+	}
+	if (requested_us > 0 && !st->initial_preroll_complete) {
+		st->initial_preroll_complete = 1;
+		log_printf("software video: seek preroll complete frame=%llu ms requested=%llu ms",
+		           (unsigned long long)(pts_us / 1000ULL),
+		           (unsigned long long)st->initial_position_ms);
+	}
 	/* If a reordered picture arrives after its presentation deadline has already
 	 * passed, showing it would move the image backwards in time. This should be
 	 * rare with the 16-slot look-ahead queue, but failing closed here avoids a
@@ -537,27 +554,6 @@ static int read_video_packet(SoftwareVideoState *st, AVPacket *packet) {
 	int ret;
 	while ((ret = av_read_frame(st->demux, packet)) >= 0) {
 		if (packet->stream_index == st->stream_index) {
-			if (st->initial_position_ms > 0 && !st->initial_keyframe_found) {
-				int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts
-				                                            : packet->dts;
-				int64_t pts_ms = pts == AV_NOPTS_VALUE ? -1
-				               : av_rescale_q(pts, st->time_base,
-				                              (AVRational){ 1, 1000 });
-				/* Growing MOV input deliberately has no seek callback. Scanning
-				 * packets up to the requested timestamp keeps read_header from
-				 * forcing a full-file index, and discarding them here avoids doing
-				 * H.264 work for the skipped portion. Begin only at a random-access
-				 * picture so the decoder never receives an orphaned inter frame. */
-				if (pts_ms < 0 || (uint64_t)pts_ms < st->initial_position_ms ||
-				    !(packet->flags & AV_PKT_FLAG_KEY)) {
-					av_packet_unref(packet);
-					continue;
-				}
-				st->initial_keyframe_found = 1;
-				log_printf("software video: resume keyframe=%lld ms requested=%llu ms",
-				           (long long)pts_ms,
-				           (unsigned long long)st->initial_position_ms);
-			}
 			return 1;
 		}
 		av_packet_unref(packet);
@@ -907,7 +903,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	st->content_height = height;
 	st->source_fps = expected_fps;
 	st->initial_position_ms = initial_position_ms;
-	st->initial_keyframe_found = initial_position_ms == 0;
+	st->initial_preroll_complete = initial_position_ms == 0;
 	if (st->source_fps <= 0 && stream->avg_frame_rate.num > 0 &&
 	    stream->avg_frame_rate.den > 0) {
 		st->source_fps = (stream->avg_frame_rate.num +

@@ -81,8 +81,11 @@ The complete render loop is in `examples/local_file.c`.
 - `start_position_ms`, seeking, stream-reported bitrate, duration, decoded/shown
   counters, and dropped-frame counters are exposed through the public config and
   status structures. Runtime seeks reuse the open demuxers, seek backward to a
-  valid H.264 random-access picture, decode the required preroll, and publish
-  frames only from the requested timestamp. Only the decode pipelines are
+  valid H.264 random-access picture, feed that preceding keyframe and its
+  dependent packets into H.264, and discard only decoded preroll pictures before
+  publishing from the requested timestamp. Compressed reference packets are
+  never discarded merely because their PTS precedes a backward-seek target.
+  Only the decode pipelines are
   rebuilt; after the owner fences GXM and calls
   `vita_sw_decoder_prepare_background_restart()`, the copied surfaces follow a
   conservative full teardown/reallocation lifecycle so no stale GXM or AVFrame

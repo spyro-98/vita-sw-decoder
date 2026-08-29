@@ -67,7 +67,7 @@ typedef struct {
 	int continuous_high_fps;
 	int queue_capacity;
 	uint64_t initial_position_ms;
-	int initial_keyframe_found;
+	int initial_preroll_complete;
 
 	SoftwareVideoFrameSlot slots[SOFTWARE_VIDEO_FRAME_SLOTS];
 	SoftwareVideoZeroSurface zero_surfaces[SOFTWARE_VIDEO_ZERO_COPY_SURFACES];
