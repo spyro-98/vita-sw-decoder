@@ -78,6 +78,27 @@ static int interrupt_cb(void *opaque) {
 	return cancel && *cancel;
 }
 
+static int playback_streams_ready(const AVFormatContext *format) {
+	int have_video = 0;
+	for (unsigned int i = 0; format && i < format->nb_streams; i++) {
+		const AVStream *stream = format->streams[i];
+		const AVCodecParameters *params = stream->codecpar;
+		if (params->codec_type == AVMEDIA_TYPE_VIDEO &&
+		    params->codec_id == AV_CODEC_ID_H264) {
+			if (params->width <= 0 || params->height <= 0 ||
+			    stream->time_base.num <= 0 || stream->time_base.den <= 0)
+				return 0;
+			have_video = 1;
+		} else if (params->codec_type == AVMEDIA_TYPE_AUDIO &&
+		           params->codec_id == AV_CODEC_ID_AAC &&
+		           (params->sample_rate <= 0 ||
+		            params->ch_layout.nb_channels <= 0)) {
+			return 0;
+		}
+	}
+	return have_video;
+}
+
 static int indexed_container(const AVFormatContext *format) {
 	const char *name = format && format->iformat ? format->iformat->name : NULL;
 	return name && (strstr(name, "mov,mp4") || strstr(name, "matroska") ||
@@ -137,9 +158,11 @@ static int input_open(VitaSwDecoderInput *input,
 		input_close(input);
 		return ret;
 	}
-	/* MOV/MP4 normally exposes complete codec parameters from moov during
-	 * open. The bounded analysis also supports TS and less conventional files. */
-	ret = indexed_container(input->format)
+	/* Fast indexed files normally expose everything during open. Run bounded
+	 * discovery whenever the exact H.264/AAC parameters needed by playback are
+	 * incomplete; container type alone is not evidence that they are ready. */
+	ret = indexed_container(input->format) &&
+	      playback_streams_ready(input->format)
 	    ? 0 : avformat_find_stream_info(input->format, NULL);
 	if (ret < 0) {
 		input_close(input);
@@ -333,21 +356,21 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	player->duration_ms = input_duration_ms(player->video_input.format);
 	if (!player->duration_ms && player->has_audio)
 		player->duration_ms = input_duration_ms(player->audio_input.format);
+	if (player->duration_ms && start_position_ms >= player->duration_ms)
+		start_position_ms = 0;
 
 	if (start_position_ms > 0) {
-		AVStream *video_stream = player->video_input.format->streams[video_index];
-		int64_t video_target = av_rescale_q((int64_t)start_position_ms,
-		                                    (AVRational){ 1, 1000 },
-		                                    video_stream->time_base);
-		av_seek_frame(player->video_input.format, video_index, video_target,
-		              AVSEEK_FLAG_BACKWARD);
-		if (player->has_audio) {
-			AVStream *audio_stream = player->audio_input.format->streams[audio_index];
-			int64_t audio_target = av_rescale_q((int64_t)start_position_ms,
-			                                    (AVRational){ 1, 1000 },
-			                                    audio_stream->time_base);
-			av_seek_frame(player->audio_input.format, audio_index, audio_target,
-			              AVSEEK_FLAG_BACKWARD);
+		ret = seek_input_ms(&player->video_input, video_index, start_position_ms);
+		if (ret >= 0 && player->has_audio)
+			ret = seek_input_ms(&player->audio_input, audio_index, start_position_ms);
+		if (ret < 0) {
+			/* A stale history point must never turn startup into a linear decode
+			 * across a long file. Fall back to a checked beginning seek and report
+			 * position zero to both pipelines. */
+			seek_input_ms(&player->video_input, video_index, 0);
+			if (player->has_audio)
+				seek_input_ms(&player->audio_input, audio_index, 0);
+			start_position_ms = 0;
 		}
 	}
 

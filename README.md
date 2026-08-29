@@ -49,6 +49,12 @@ The complete render loop is in `examples/local_file.c`.
   status structures. Runtime seeks reuse the open demuxers, flush to the target
   keyframe, and rebuild only the decode pipelines; a full reopen remains the
   recovery fallback.
+- Stream discovery runs within the configured probe/analyse bounds whenever
+  the required H.264/AAC parameters are incomplete, including for indexed MP4
+  and Matroska inputs; complete indexed inputs keep the fast path. If an initial
+  saved-position seek fails or
+  points at/past the reported end, playback performs a checked restart at zero
+  rather than decoding linearly through a long file.
 - A stream factory can represent a Vita file or an authenticated remote reader,
   but every `open()` call must return a fresh readable, seekable cursor.
 
