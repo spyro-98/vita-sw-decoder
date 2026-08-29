@@ -125,6 +125,7 @@ typedef struct SoftwareVideoDebugSnapshot {
 	int direct_rendering;
 	int source_fps;
 	int ready_frames;
+	int have_display;
 	int queue_capacity;
 	int catchup_nonref;
 	uint32_t ring_memory_bytes;

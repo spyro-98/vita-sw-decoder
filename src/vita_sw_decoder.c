@@ -1651,7 +1651,7 @@ void vita_sw_decoder_get_status(VitaSwDecoderPlayer *player,
 	status->position_ms = status_clock_us / 1000ULL;
 	status->hardware_accelerated = debug.hardware_accelerated;
 	status->direct_rendering = debug.direct_rendering;
-	status->ready_frames = debug.ready_frames;
+	status->ready_frames = debug.ready_frames + (debug.have_display ? 1 : 0);
 	status->frame_capacity = debug.queue_capacity;
 	status->fps = debug.source_fps;
 	status->frames_decoded = debug.frames_decoded;

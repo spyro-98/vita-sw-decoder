@@ -52,7 +52,9 @@ The complete render loop is in `examples/local_file.c`.
 ## Current playback contract
 
 - H.264 is decoded by FFmpeg on the CPU with Vita-tuned pthread workers; this
-  package never loads or selects `h264_vita`.
+  package never loads or selects `h264_vita`. Copied U/V frames use GXM's
+  matching `YUV420P2` sampling format, and the retained display surface counts
+  as available between video deadlines rather than reporting false buffering.
 - MOV/MP4 and Matroska sources may contain optional AAC audio. The initial
   zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`;
   an ordinal outside the playable AAC snapshot is clamped to track zero during

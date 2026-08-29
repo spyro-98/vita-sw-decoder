@@ -1259,8 +1259,7 @@ int vita_sw_software_video_present_rect(SoftwareVideoState *st,
 	                     : st->slots[display].pixels;
 	int tex_ret = sceGxmTextureInitLinear(
 	    &st->texture.gxm_tex, texture_pixels,
-	    st->zero_copy ? SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1
-	                  : SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
+	    SCE_GXM_TEXTURE_FORMAT_YUV420P2_CSC1,
 	    st->texture_width, st->texture_height, 0);
 	if (tex_ret < 0) {
 		log_printf("software video: sceGxmTextureInitLinear -> 0x%08X",
@@ -1346,6 +1345,7 @@ void vita_sw_software_video_debug_snapshot(SoftwareVideoState *st,
 	slots_lock(st);
 	for (int i = 0; i < st->queue_capacity; i++)
 		if (st->slots[i].state == SLOT_READY) snapshot->ready_frames++;
+	snapshot->have_display = st->display_slot >= 0;
 	snapshot->source_fps = st->source_fps;
 	snapshot->hardware_accelerated = st->hardware_accelerated;
 	snapshot->direct_rendering = st->hardware_accelerated && st->zero_copy;
