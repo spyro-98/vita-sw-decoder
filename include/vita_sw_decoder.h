@@ -24,6 +24,9 @@ typedef struct VitaSwDecoderPlayer VitaSwDecoderPlayer;
 
 typedef struct VitaSwDecoderPlayerConfig {
 	VitaSwDecoderStreamFactory stream;
+	/* Zero-based AAC track ordinal. Zero preserves the historical behavior of
+	 * selecting the first playable audio stream. */
+	int audio_track;
 	uint32_t expected_width;
 	uint32_t expected_height;
 	int expected_fps;
@@ -77,6 +80,12 @@ void vita_sw_decoder_request_stop(VitaSwDecoderPlayer *player);
 
 /* Reopens both independent cursors at the requested media timestamp. */
 int vita_sw_decoder_seek(VitaSwDecoderPlayer *player, uint64_t position_ms);
+
+/* Reopens the audio cursor at position_ms with another AAC track while
+ * preserving the current pause and volume state. */
+int vita_sw_decoder_select_audio_track(VitaSwDecoderPlayer *player,
+	                                   int audio_track,
+	                                   uint64_t position_ms);
 
 /* Call present() inside a vita2d drawing scene, then render_complete() after
  * vita2d_wait_rendering_done(). */

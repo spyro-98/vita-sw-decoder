@@ -142,11 +142,12 @@ static int input_open(VitaSwDecoderInput *input,
 }
 
 static int find_stream(const AVFormatContext *format, enum AVMediaType type,
-	                   enum AVCodecID codec) {
+	                   enum AVCodecID codec, int ordinal) {
+	if (ordinal < 0) return -1;
 	for (unsigned int i = 0; format && i < format->nb_streams; i++) {
 		const AVCodecParameters *params = format->streams[i]->codecpar;
-		if (params->codec_type == type && params->codec_id == codec)
-			return (int)i;
+		if (params->codec_type != type || params->codec_id != codec) continue;
+		if (ordinal-- == 0) return (int)i;
 	}
 	return -1;
 }
@@ -186,9 +187,10 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	                     player->cancel);
 	if (ret < 0) goto fail;
 	int video_index = find_stream(player->video_input.format,
-	                              AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264);
+	                              AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264, 0);
 	int audio_index = find_stream(player->video_input.format,
-	                              AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+	                              AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC,
+	                              player->config.audio_track);
 	if (video_index < 0) {
 		ret = AVERROR_DECODER_NOT_FOUND;
 		goto fail;
@@ -204,7 +206,8 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		                 player->cancel);
 		if (ret < 0) goto fail;
 		audio_index = find_stream(player->audio_input.format,
-		                          AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+		                          AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC,
+		                          player->config.audio_track);
 		if (audio_index < 0) { ret = AVERROR_DECODER_NOT_FOUND; goto fail; }
 		player->has_audio = 1;
 	}
@@ -277,6 +280,7 @@ int vita_sw_decoder_open(VitaSwDecoderPlayer *player,
 	if (!player || !config || !config->stream.open) return AVERROR(EINVAL);
 	close_session(player);
 	player->config = *config;
+	if (player->config.audio_track < 0) player->config.audio_track = 0;
 	if (player->config.volume_percent < 0) player->config.volume_percent = 0;
 	if (player->config.volume_percent > 300) player->config.volume_percent = 300;
 	player->paused = 0;
@@ -320,6 +324,27 @@ int vita_sw_decoder_seek(VitaSwDecoderPlayer *player, uint64_t position_ms) {
 	close_session(player);
 	player->paused = paused;
 	return open_session(player, position_ms);
+}
+
+int vita_sw_decoder_select_audio_track(VitaSwDecoderPlayer *player,
+	                                   int audio_track,
+	                                   uint64_t position_ms) {
+	if (!player || !player->opened || audio_track < 0) return AVERROR(EINVAL);
+	if (audio_track == player->config.audio_track) return 0;
+	if (player->duration_ms && position_ms > player->duration_ms)
+		position_ms = player->duration_ms;
+	int previous_track = player->config.audio_track;
+	int paused = player->paused;
+	close_session(player);
+	player->paused = paused;
+	player->config.audio_track = audio_track;
+	int ret = open_session(player, position_ms);
+	if (ret >= 0) return 0;
+	/* A transient remote failure must not silently leave the player on a dead
+	 * session. Make one best-effort recovery with the previous track. */
+	player->config.audio_track = previous_track;
+	open_session(player, position_ms);
+	return ret;
 }
 
 static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
