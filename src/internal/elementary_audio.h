@@ -28,6 +28,7 @@ typedef struct {
 	AVPacket *prefetched_packet; /* first probed TS AU, consumed by the worker */
 	int input_is_adts;
 	volatile int paused;       /* the caller raises/lowers it, the thread honors it */
+	volatile int stop;         /* restart only this audio pipeline */
 	volatile int volume_percent; /* shared 0..300 perceived volume */
 	uint64_t initial_position_ms; /* progressive restart: discard earlier AUs */
 	int port;

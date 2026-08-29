@@ -57,16 +57,17 @@ static int parse_adts_header(const uint8_t *data, size_t size,
  * AVFormatContext by the caller, see elementary_audio.h). */
 static int read_audio_packet(ElementaryAudioState *st, AVPacket *packet) {
 	if (st->prefetched_packet) {
+		if (st->stop) return AVERROR_EXIT;
 		av_packet_move_ref(packet, st->prefetched_packet);
 		av_packet_free(&st->prefetched_packet);
 		return 1;
 	}
-	int ret;
-	while ((ret = av_read_frame(st->demux, packet)) >= 0) {
+	int ret = AVERROR_EXIT;
+	while (!st->stop && (ret = av_read_frame(st->demux, packet)) >= 0) {
 		if (packet->stream_index == st->stream_index) return 1;
 		av_packet_unref(packet);
 	}
-	return ret == AVERROR_EOF ? 0 : ret;
+	return st->stop ? AVERROR_EXIT : ret == AVERROR_EOF ? 0 : ret;
 }
 
 static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
@@ -83,10 +84,10 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	const AVRational us_tb = { 1, 1000000 };
 	int decode_attempts = 0;
 	int last_applied_volume = -1;
-	while (st->start_gate && !*st->start_gate && !*st->cancel)
+	while (st->start_gate && !*st->start_gate && !*st->cancel && !st->stop)
 		sceKernelDelayThread(1000);
 
-	while (!*st->cancel) {
+	while (!*st->cancel && !st->stop) {
 		int requested_volume = st->volume_percent;
 		if (requested_volume != last_applied_volume && st->port >= 0) {
 			last_applied_volume = requested_volume;
@@ -115,7 +116,7 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			/* If cancel is already raised, the error is almost certainly the
 			 * interrupt_callback abort: it is not a decode failure, so we
 			 * exit cleanly without had_error. */
-			if (!*st->cancel) {
+			if (!*st->cancel && !st->stop) {
 				log_printf("elementary_audio: av_read_frame -> %d", ret);
 				st->had_error = 1;
 			}
@@ -167,7 +168,7 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		}
 		/* A pause that lands after decode must not discard this access unit.
 		 * The per-grain loop below holds the decoded PCM until resume. */
-		if (*st->cancel) continue;
+		if (*st->cancel || st->stop) continue;
 
 		/* The AudioOut port consumes exactly the grain chosen at open (1024
 		 * samples/channel). SBR can make one AAC access unit produce 2048
@@ -199,9 +200,9 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		               ? av_rescale_q(pts, stream_tb, us_tb) : AV_NOPTS_VALUE;
 		for (uint32_t offset = 0; offset < decoded.frames;
 		     offset += ELEMENTARY_AUDIO_GRAIN) {
-			while (st->paused && !*st->cancel)
+			while (st->paused && !*st->cancel && !st->stop)
 				sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
-			if (*st->cancel) break;
+			if (*st->cancel || st->stop) break;
 			const int16_t *grain = decoded.pcm + offset * st->decoder.channels;
 			int output_ret = sceAudioOutOutput(st->port, grain);
 			if (output_ret < 0) {
@@ -220,7 +221,7 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 				                         ? UINT32_MAX : (uint32_t)(end_us / 1000ULL);
 			}
 		}
-		if (st->had_error || *st->cancel) break;
+		if (st->had_error || *st->cancel || st->stop) break;
 	}
 
 	av_packet_free(&packet);
