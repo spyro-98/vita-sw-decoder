@@ -52,8 +52,8 @@ The complete render loop is in `examples/local_file.c`.
 ## Current playback contract
 
 - H.264 is decoded by FFmpeg on the CPU with Vita-tuned pthread workers; this
-  package never loads or selects `h264_vita`. Copied U/V frames use GXM's
-  matching `YUV420P2` sampling format, and the retained display surface counts
+  package never loads or selects `h264_vita`. Copied U/V frames use the
+  known-working online renderer's `YVU420P2` GXM sampling contract, and the retained display surface counts
   as available between video deadlines rather than reporting false buffering.
 - MOV/MP4 and Matroska sources may contain optional AAC audio. The initial
   zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`;
@@ -84,9 +84,10 @@ The complete render loop is in `examples/local_file.c`.
   valid H.264 random-access picture, decode the required preroll, and publish
   frames only from the requested timestamp. Only the decode pipelines are
   rebuilt; after the owner fences GXM and calls
-  `vita_sw_decoder_prepare_background_restart()`, same-size seeks retain and
-  reuse their CDRAM/AVFrame pool without waiting for vita2d on the worker. A
-  normal close keeps the conservative render wait, and a full reopen remains
+  `vita_sw_decoder_prepare_background_restart()`, the copied surfaces follow a
+  conservative full teardown/reallocation lifecycle so no stale GXM or AVFrame
+  ownership crosses the seek. A normal close keeps the conservative render
+  wait, and a full reopen remains
   the recovery fallback for non-cancellation failures. A seek at the reported
   duration is clamped inside the video-stream end by at least 250 ms so the final
   GOP cannot be mistaken for a broken empty startup. Audio is released after the

@@ -204,30 +204,11 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 	return 0;
 }
 
-static int64_t media_timeline_origin_us(const AVFormatContext *format) {
-	if (!format) return 0;
-	if (format->start_time != AV_NOPTS_VALUE) return format->start_time;
-	int64_t earliest = AV_NOPTS_VALUE;
-	for (unsigned int i = 0; i < format->nb_streams; i++) {
-		const AVStream *stream = format->streams[i];
-		if (stream->start_time == AV_NOPTS_VALUE ||
-		    (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
-		     stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-		     stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) ||
-		    (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
-		int64_t value = av_rescale_q(stream->start_time, stream->time_base,
-		                             AV_TIME_BASE_Q);
-		if (earliest == AV_NOPTS_VALUE || value < earliest) earliest = value;
-	}
-	return earliest == AV_NOPTS_VALUE ? 0 : earliest;
-}
-
 static uint64_t scale_frame_timestamp_us(const SoftwareVideoState *st,
 	                                     int64_t pts) {
 	if (pts == AV_NOPTS_VALUE) return 0;
 	int64_t scaled = av_rescale_q(pts, st->time_base,
-	                              (AVRational){ 1, 1000000 }) -
-	                 st->timeline_origin_us;
+	                              (AVRational){ 1, 1000000 });
 	return scaled < 0 ? 0 : (uint64_t)scaled;
 }
 
@@ -408,14 +389,6 @@ static int copy_yuv420_frame(SoftwareVideoState *st, int slot_index,
 
 static int publish_frame(SoftwareVideoState *st, const AVFrame *frame) {
 	uint64_t pts_us = frame_pts_us(st, frame);
-	uint64_t requested_us = st->initial_position_ms * 1000ULL;
-	if (requested_us && pts_us >= requested_us &&
-	    !st->initial_preroll_complete) {
-		st->initial_preroll_complete = 1;
-		log_printf("software video: preroll completed frame=%llu ms requested=%llu ms\n",
-		           (unsigned long long)(pts_us / 1000ULL),
-		           (unsigned long long)st->initial_position_ms);
-	}
 	/* observed_clock_us is written by the 32-bit ARM presentation thread.
 	 * Keep it and the related 64-bit diagnostics under the existing ring lock
 	 * so a read cannot combine halves from two different clock samples. */
@@ -423,17 +396,6 @@ static int publish_frame(SoftwareVideoState *st, const AVFrame *frame) {
 	uint64_t clock_us = st->observed_clock_us;
 	st->frames_decoded++;
 	st->last_decoded_pts_us = pts_us;
-	/* avformat_seek_file(..., AVSEEK_FLAG_BACKWARD) deliberately positions the
-	 * demuxer at the random-access picture before the requested timestamp. Feed
-	 * that keyframe and its dependent pictures to H.264, then hide only decoded
-	 * output that belongs to the preroll interval. Discarding compressed packets
-	 * until a later keyframe made seeks scan an entire GOP and could reach EOF
-	 * when the requested point was close to the end of a long video. */
-	if (requested_us && pts_us < requested_us) {
-		st->frames_dropped++;
-		slots_unlock(st);
-		return 0;
-	}
 	/* If a reordered picture arrives after its presentation deadline has already
 	 * passed, showing it would move the image backwards in time. This should be
 	 * rare with the 16-slot look-ahead queue, but failing closed here avoids a
@@ -574,7 +536,30 @@ static int flush_frames(SoftwareVideoState *st, AVFrame *frame) {
 static int read_video_packet(SoftwareVideoState *st, AVPacket *packet) {
 	int ret;
 	while ((ret = av_read_frame(st->demux, packet)) >= 0) {
-		if (packet->stream_index == st->stream_index) return 1;
+		if (packet->stream_index == st->stream_index) {
+			if (st->initial_position_ms > 0 && !st->initial_keyframe_found) {
+				int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts
+				                                            : packet->dts;
+				int64_t pts_ms = pts == AV_NOPTS_VALUE ? -1
+				               : av_rescale_q(pts, st->time_base,
+				                              (AVRational){ 1, 1000 });
+				/* Growing MOV input deliberately has no seek callback. Scanning
+				 * packets up to the requested timestamp keeps read_header from
+				 * forcing a full-file index, and discarding them here avoids doing
+				 * H.264 work for the skipped portion. Begin only at a random-access
+				 * picture so the decoder never receives an orphaned inter frame. */
+				if (pts_ms < 0 || (uint64_t)pts_ms < st->initial_position_ms ||
+				    !(packet->flags & AV_PKT_FLAG_KEY)) {
+					av_packet_unref(packet);
+					continue;
+				}
+				st->initial_keyframe_found = 1;
+				log_printf("software video: resume keyframe=%lld ms requested=%llu ms",
+				           (long long)pts_ms,
+				           (unsigned long long)st->initial_position_ms);
+			}
+			return 1;
+		}
 		av_packet_unref(packet);
 	}
 	return ret == AVERROR_EOF ? 0 : ret;
@@ -839,27 +824,6 @@ static void release_frame_buffers(SoftwareVideoState *st) {
 	}
 	for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++)
 		free_zero_surface(&st->zero_surfaces[i]);
-	st->ring_memory_bytes = 0;
-	st->hardware_direct_available = 0;
-	st->buffers_retained = 0;
-}
-
-static void retain_frame_buffers(SoftwareVideoState *st) {
-	if (!st) return;
-	/* The worker and codec have already stopped, so these are the final CPU-side
-	 * AVBufferRef owners. The public restart contract guarantees that GXM has also
-	 * finished sampling the raw CDRAM addresses. */
-	for (int i = 0; i < SOFTWARE_VIDEO_FRAME_SLOTS; i++) {
-		if (st->slots[i].frame) av_frame_unref(st->slots[i].frame);
-		st->slots[i].pts_us = 0;
-		st->slots[i].serial = 0;
-		st->slots[i].state = SLOT_FREE;
-	}
-	for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++)
-		st->zero_surfaces[i].in_use = 0;
-	st->display_slot = -1;
-	st->retire_slot = -1;
-	st->buffers_retained = 1;
 }
 
 static int allocate_copy_ring(SoftwareVideoState *st) {
@@ -907,6 +871,18 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	                     volatile int *cancel,
 	                     volatile int *start_gate) {
 	if (!st || !demux || !cancel) return AVERROR(EINVAL);
+	memset(st, 0, sizeof(*st));
+	st->demux = demux;
+	st->cancel = cancel;
+	st->start_gate = start_gate;
+	st->display_slot = -1;
+	st->retire_slot = -1;
+	st->queue_capacity = SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
+	for (int i = 0; i < SOFTWARE_VIDEO_FRAME_SLOTS; i++)
+		st->slots[i].memblock = -1;
+	for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++)
+		st->zero_surfaces[i].memblock = -1;
+
 	if (stream_index < 0) stream_index = first_video_stream(demux);
 	if (stream_index < 0 || (unsigned int)stream_index >= demux->nb_streams)
 		return AVERROR_STREAM_NOT_FOUND;
@@ -927,59 +903,11 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 		log_printf("software video: dimensions exceed budget %ux%u", width, height);
 		return AVERROR(EINVAL);
 	}
-	uint32_t texture_width = ALIGN_UP_U32(width, 16);
-	uint32_t texture_height = ALIGN_UP_U32(height, 16);
-	uint32_t pitch = texture_width;
-	uint32_t frame_bytes = pitch * texture_height * 3 / 2;
-	int reuse_buffers = st->buffers_retained &&
-	                    st->content_width == width &&
-	                    st->content_height == height &&
-	                    st->texture_width == texture_width &&
-	                    st->texture_height == texture_height &&
-	                    st->frame_bytes == frame_bytes;
-	SoftwareVideoFrameSlot retained_slots[SOFTWARE_VIDEO_FRAME_SLOTS];
-	SoftwareVideoZeroSurface retained_surfaces[SOFTWARE_VIDEO_ZERO_COPY_SURFACES];
-	uint32_t retained_ring_memory_bytes = 0;
-	int retained_hardware_direct_available = 0;
-	if (reuse_buffers) {
-		memcpy(retained_slots, st->slots, sizeof(retained_slots));
-		memcpy(retained_surfaces, st->zero_surfaces,
-		       sizeof(retained_surfaces));
-		retained_ring_memory_bytes = st->ring_memory_bytes;
-		retained_hardware_direct_available = st->hardware_direct_available;
-	} else if (st->buffers_retained) {
-		uint64_t release_started_us = sceKernelGetProcessTimeWide();
-		release_frame_buffers(st);
-		log_printf("software video: retained pool resize old=%ux%u new=%ux%u release=%llu ms",
-		           st->content_width, st->content_height, width, height,
-		           (unsigned long long)((sceKernelGetProcessTimeWide() -
-		                                release_started_us) / 1000ULL));
-	}
-
-	memset(st, 0, sizeof(*st));
-	st->demux = demux;
-	st->cancel = cancel;
-	st->start_gate = start_gate;
-	st->display_slot = -1;
-	st->retire_slot = -1;
-	st->queue_capacity = SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
-	if (reuse_buffers) {
-		memcpy(st->slots, retained_slots, sizeof(retained_slots));
-		memcpy(st->zero_surfaces, retained_surfaces,
-		       sizeof(retained_surfaces));
-		st->ring_memory_bytes = retained_ring_memory_bytes;
-		st->hardware_direct_available = retained_hardware_direct_available;
-	} else {
-		for (int i = 0; i < SOFTWARE_VIDEO_FRAME_SLOTS; i++)
-			st->slots[i].memblock = -1;
-		for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++)
-			st->zero_surfaces[i].memblock = -1;
-	}
 	st->content_width = width;
 	st->content_height = height;
 	st->source_fps = expected_fps;
 	st->initial_position_ms = initial_position_ms;
-	st->timeline_origin_us = media_timeline_origin_us(demux);
+	st->initial_keyframe_found = initial_position_ms == 0;
 	if (st->source_fps <= 0 && stream->avg_frame_rate.num > 0 &&
 	    stream->avg_frame_rate.den > 0) {
 		st->source_fps = (stream->avg_frame_rate.num +
@@ -1003,32 +931,29 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	/* wiliwili's public h264_vita direct path requests VITA_NV12, whose decoder
 	 * pitch is 16-byte aligned. Match it exactly for cropped widths such as 854;
 	 * it is also sufficient for the NEON copy fallback. */
-	st->texture_width = texture_width;
+	st->texture_width = ALIGN_UP_U32(width, 16);
 	/* h264_vita's public direct-render contract lays the UV plane after the
 	 * 16-row-aligned decoded height. Keep the GXM texture on that exact layout;
 	 * the CPU copy fallback writes only visible rows and does not need to mirror
 	 * libavcodec's private SIMD allocation envelope. */
-	st->texture_height = texture_height;
-	st->pitch = pitch;
-	st->frame_bytes = frame_bytes;
+	st->texture_height = ALIGN_UP_U32(height, 16);
+	st->pitch = st->texture_width;
+	st->frame_bytes = st->pitch * st->texture_height * 3 / 2;
 
 	/* Keep the copied ring allocated even when hardware direct rendering is
 	 * available. It is the immediate, in-process landing zone if h264_vita
 	 * rejects the first SPS/AU and the startup packets are replayed on CPU. */
-	uint64_t buffer_started_us = sceKernelGetProcessTimeWide();
-	int buffer_ret = reuse_buffers ? 0 : allocate_copy_ring(st);
+	int buffer_ret = allocate_copy_ring(st);
 	if (buffer_ret < 0) {
 		log_printf("software video: P2 ring allocation failed -> %d",
 		           buffer_ret);
 		release_frame_buffers(st);
 		return buffer_ret;
 	}
-	if (!reuse_buffers)
-		st->ring_memory_bytes = st->slots[0].allocation_size *
-		                       SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
+	st->ring_memory_bytes = st->slots[0].allocation_size *
+	                       SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
 #if VITA_SW_DECODER_HAS_H264_VITA
-	if (!reuse_buffers && SOFTWARE_VIDEO_HARDWARE_DIRECT_ENABLED &&
-	    st->hardware_runtime_ready) {
+	if (SOFTWARE_VIDEO_HARDWARE_DIRECT_ENABLED && st->hardware_runtime_ready) {
 		buffer_ret = allocate_zero_copy_pool(st);
 		if (buffer_ret >= 0) {
 			st->hardware_direct_available = 1;
@@ -1046,11 +971,6 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 		}
 	}
 #endif
-	log_printf("software video: frame pool %s setup=%llu ms memory=%u KiB",
-	           reuse_buffers ? "reused" : "allocated",
-	           (unsigned long long)((sceKernelGetProcessTimeWide() -
-	                                buffer_started_us) / 1000ULL),
-	           st->ring_memory_bytes / 1024u);
 
 	pthread_attr_t attr;
 	int ret = pthread_attr_init(&attr);
@@ -1259,7 +1179,8 @@ int vita_sw_software_video_present_rect(SoftwareVideoState *st,
 	                     : st->slots[display].pixels;
 	int tex_ret = sceGxmTextureInitLinear(
 	    &st->texture.gxm_tex, texture_pixels,
-	    SCE_GXM_TEXTURE_FORMAT_YUV420P2_CSC1,
+	    st->zero_copy ? SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1
+	                  : SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
 	    st->texture_width, st->texture_height, 0);
 	if (tex_ret < 0) {
 		log_printf("software video: sceGxmTextureInitLinear -> 0x%08X",
@@ -1382,7 +1303,6 @@ void vita_sw_software_video_render_complete(SoftwareVideoState *st) {
 
 void vita_sw_software_video_join(SoftwareVideoState *st) {
 	if (!st) return;
-	uint64_t started_us = sceKernelGetProcessTimeWide();
 	st->stop = 1;
 	if (st->started) {
 		int join_ret = pthread_join(st->thread, NULL);
@@ -1393,14 +1313,9 @@ void vita_sw_software_video_join(SoftwareVideoState *st) {
 			__sync_synchronize();
 		}
 	}
-	uint64_t worker_done_us = sceKernelGetProcessTimeWide();
 	/* A slot may still be referenced by the most recently queued draw. */
 	vita2d_wait_rendering_done();
-	uint64_t gpu_done_us = sceKernelGetProcessTimeWide();
-	log_printf("software video: join mode=close worker=%llu ms gpu=%llu ms total=%llu ms frames=%u shown=%u dropped=%u eof=%d err=%d",
-	           (unsigned long long)((worker_done_us - started_us) / 1000ULL),
-	           (unsigned long long)((gpu_done_us - worker_done_us) / 1000ULL),
-	           (unsigned long long)((gpu_done_us - started_us) / 1000ULL),
+	log_printf("software video: join frames=%u shown=%u dropped=%u eof=%d err=%d",
 	           st->frames_decoded, st->frames_shown, st->frames_dropped,
 	           st->eof, st->had_error);
 	release_frame_buffers(st);
@@ -1408,52 +1323,10 @@ void vita_sw_software_video_join(SoftwareVideoState *st) {
 }
 
 void vita_sw_software_video_join_for_restart(SoftwareVideoState *st) {
-	if (!st) return;
-	uint64_t started_us = sceKernelGetProcessTimeWide();
-	st->stop = 1;
-	if (st->started) {
-		int join_ret = pthread_join(st->thread, NULL);
-		if (join_ret != 0) {
-			log_printf("software video: pthread_join -> %d", join_ret);
-			while (!st->thread_done)
-				sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
-			__sync_synchronize();
-		}
-	}
-	uint64_t worker_done_us = sceKernelGetProcessTimeWide();
-	retain_frame_buffers(st);
-	st->started = 0;
-	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("software video: join mode=restart worker=%llu ms retain=%llu ms total=%llu ms frames=%u shown=%u dropped=%u eof=%d err=%d",
-	           (unsigned long long)((worker_done_us - started_us) / 1000ULL),
-	           (unsigned long long)((completed_us - worker_done_us) / 1000ULL),
-	           (unsigned long long)((completed_us - started_us) / 1000ULL),
-	           st->frames_decoded, st->frames_shown, st->frames_dropped,
-	           st->eof, st->had_error);
-	/* Deliberately no vita2d_wait_rendering_done(): the public preparation API
-	 * makes the caller's completed GPU fence a precondition. */
+	/* Keep the working full teardown semantics across seek/reopen operations. */
+	vita_sw_software_video_join(st);
 }
 
 void vita_sw_software_video_join_after_gpu_fence(SoftwareVideoState *st) {
-	if (!st) return;
-	uint64_t started_us = sceKernelGetProcessTimeWide();
-	st->stop = 1;
-	if (st->started) {
-		int join_ret = pthread_join(st->thread, NULL);
-		if (join_ret != 0) {
-			log_printf("software video: pthread_join -> %d", join_ret);
-			while (!st->thread_done)
-				sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
-			__sync_synchronize();
-		}
-	}
-	uint64_t worker_done_us = sceKernelGetProcessTimeWide();
-	release_frame_buffers(st);
-	st->started = 0;
-	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("software video: join mode=fenced-close worker=%llu ms release=%llu ms total=%llu ms",
-	           (unsigned long long)((worker_done_us - started_us) / 1000ULL),
-	           (unsigned long long)((completed_us - worker_done_us) / 1000ULL),
-	           (unsigned long long)((completed_us - started_us) / 1000ULL));
-	/* Deliberately no vita2d_wait_rendering_done(); see join_for_restart(). */
+	vita_sw_software_video_join(st);
 }
