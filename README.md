@@ -10,6 +10,20 @@ the public Vita audio decoder. It never loads ReAvPlayer and never selects
 </p>
 <p align="center"><sub>FFmpeg software H.264 playback on PlayStation Vita</sub></p>
 
+## 2.0 ABI migration
+
+Version 2 adds `open_with_cancel` to `VitaSwDecoderStreamFactory` and the
+non-owning `abort` callback to `VitaSwDecoderStreamHandle`. These additions also
+change the layout of `VitaSwDecoderPlayerConfig`. Rebuild every consumer against
+the 2.x header and zero- or designated-initialize every public structure,
+including each handle returned by a factory; do not reuse a 1.x binary or leave
+a stack-allocated factory/handle partially initialized.
+
+```c
+VitaSwDecoderStreamFactory source = {0};
+VitaSwDecoderPlayerConfig config = {0};
+```
+
 ## Integrate in three steps
 
 ```sh
@@ -26,7 +40,7 @@ target_link_libraries(my_app PRIVATE VitaSwDecoder::VitaSwDecoder)
 ```c
 #include <vita_sw_decoder.h>
 
-VitaSwDecoderStreamFactory source;
+VitaSwDecoderStreamFactory source = {0};
 vita_sw_decoder_file_stream_factory("ux0:video/movie.mp4", &source);
 VitaSwDecoderPlayerConfig config = { .stream = source, .volume_percent = 100 };
 VitaSwDecoderPlayer *player = vita_sw_decoder_create();
@@ -40,17 +54,47 @@ The complete render loop is in `examples/local_file.c`.
 - H.264 is decoded by FFmpeg on the CPU with Vita-tuned pthread workers; this
   package never loads or selects `h264_vita`.
 - MOV/MP4 and Matroska sources may contain optional AAC audio. The initial
-  zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`.
-- `vita_sw_decoder_select_audio_track()` restarts only the audio cursor at a
-  supplied media timestamp, retaining the live video pipeline, pause, and
-  volume state.
+  zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`;
+  an ordinal outside the playable AAC snapshot is clamped to track zero during
+  open so stale preferences cannot silently disable audio.
+- The already-open video demux snapshots up to 16 playable AAC tracks and 16
+  embedded text-subtitle tracks (SubRip, ASS/SSA, WebVTT, MOV text, plain text,
+  and MicroDVD) before decode starts. `vita_sw_decoder_*_track_count()` and
+  `vita_sw_decoder_*_track_info()` expose each stream index, default flag,
+  channel count, UTF-8 language/title, and codec name without opening a third
+  probe cursor.
+- `vita_sw_decoder_select_audio_track()` seeks the already-open audio demux
+  cursor and restarts only its AAC/output pipeline at the supplied media
+  timestamp. The live video pipeline, pause, and volume state are retained, and
+  remote track changes do not reconnect or probe the container again. The
+  replacement stays gated until its worker has retained an access unit at or
+  after that timestamp. A known target at/after the stream's origin-normalized
+  end is rejected before the live worker stops; unknown or sparse tails get a
+  1.5-second readiness deadline. An empty/timed-out replacement rolls back to
+  the prior track instead of committing a silent cursor.
+- Initial playback and in-place seek restarts use that same bounded audio-start
+  helper when incomplete AAC metadata requires a synchronous ADTS access-unit
+  probe. A timed-out, transport-aborted seek follows the normal checked
+  full-session recovery path instead of reusing the poisoned cursor.
 - `start_position_ms`, seeking, stream-reported bitrate, duration, decoded/shown
   counters, and dropped-frame counters are exposed through the public config and
-  status structures. Runtime seeks reuse the open demuxers, flush to the target
-  keyframe, and rebuild only the decode pipelines; a full reopen remains the
-  recovery fallback. Audio is released after the first decoded video frame,
-  with seek preroll capped at 600 ms rather than waiting for a multi-frame
-  startup cushion.
+  status structures. Runtime seeks reuse the open demuxers, seek backward to a
+  valid H.264 random-access picture, decode the required preroll, and publish
+  frames only from the requested timestamp. Only the decode pipelines are
+  rebuilt; after the owner fences GXM and calls
+  `vita_sw_decoder_prepare_background_restart()`, same-size seeks retain and
+  reuse their CDRAM/AVFrame pool without waiting for vita2d on the worker. A
+  normal close keeps the conservative render wait, and a full reopen remains
+  the recovery fallback for non-cancellation failures. A seek at the reported
+  duration is clamped inside the video-stream end by at least 250 ms so the final GOP cannot be
+  mistaken for a broken empty startup. Audio is released after the first decoded video frame, with both
+  startup and seek first-frame waits capped at 600 ms rather than waiting for a
+  multi-frame cushion. If a selected audio stream reaches clean EOF before the
+  video, clock ownership moves to the monotonic presentation clock without
+  clearing the selected audio pipeline, so position remains continuous, the
+  video tail drains, and a later seek can restart that same track. Hidden or
+  energy-saving playback can call `vita_sw_decoder_discard_video_to_clock()`
+  after fencing GXM to keep the decode queue draining without drawing.
 - Stream discovery runs within the configured probe/analyse bounds whenever
   the required H.264/AAC parameters are incomplete, including for indexed MP4
   and Matroska inputs; complete indexed inputs keep the fast path. If an initial
@@ -58,19 +102,46 @@ The complete render loop is in `examples/local_file.c`.
   points at/past the reported end, playback performs a checked restart at zero
   rather than decoding linearly through a long file.
 - A stream factory can represent a Vita file or an authenticated remote reader,
-  but every `open()` call must return a fresh readable, seekable cursor.
+  but every open call must return a fresh readable, seekable cursor. Existing
+  factories can keep using `open`; an optional `open_with_cancel` callback
+  receives the per-operation flag so a blocked remote connection/read can stop
+  promptly. A handle may additionally provide non-owning `abort` to wake a
+  concurrently blocked cursor operation. The decoder calls it only while I/O is
+  published active: ordinary seek/track restart first allows a shared 30 ms
+  cooperative grace, while explicit stop/close interrupts immediately. It never
+  uses `abort` as `close`, and reopens that cursor before a seek or track switch
+  because transports may become unusable after abort. The callback must itself
+  return promptly; the deadline selects cancellation time but cannot make a
+  non-cooperative transport's blocked callback return.
+- Caller-owned cancellation is never written or cleared by close. Cancellation
+  also suppresses the expensive full-open recovery path; the embedding
+  application can leave its loading screen immediately and decide what to do
+  next. Audio rollback gets a fresh decoder-owned interrupt phase, so the flag
+  that cancelled a replacement cannot also suppress restoration of the prior
+  track. The UI delivers the decoder interrupt before publishing its caller
+  flag, so a forward cancellation cannot arrive late in rollback; a later
+  interrupt or session stop can still terminate a blocked restore. A
+  replacement remains gated until
+  pause/volume state is installed and its operation-only transport interrupt
+  has been cleared. If the new track fails but rollback succeeds, the call
+  returns `VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK` and the previous track
+  remains live.
+- Concise timing records identify factory open, FFmpeg header/probe, startup
+  first-frame wait, demux seek, worker join/restart, and audio-switch latency in
+  the module log for on-device performance checks.
 
-VitaMediaDeck layers track metadata, embedded text-subtitle demux, cover/frame
-previews, resume history, and player UI above this package. Those policies are
-intentionally not part of the standalone decoder API.
+VitaMediaDeck can consume the decoder's immutable track-metadata snapshot while
+layering embedded text-subtitle packet demux, cover/frame previews, resume
+history, and player UI above this package.
 
 ## Use both backends in one app
 
 `vita-sw-decoder` and `vita-hw-decoder` use the same lifecycle and stream
 contract but have distinct symbols and CMake targets, so they can be linked
 together. An application can try the hardware package first, destroy that
-session on failure, then reopen the same stream factory with
-`vita_sw_decoder_open()`. `vita_sw_decoder_backend_name()` returns `software`.
+session after a non-cancellation failure, then reopen the same stream factory
+with `vita_sw_decoder_open()`. A cancellation result must be returned directly.
+`vita_sw_decoder_backend_name()` returns `software`.
 `VitaSwDecoderPlayerStatus.video_bitrate_bps` exposes the H.264 stream bitrate
 reported by FFmpeg, with the container bitrate used only when the stream does
 not provide one. A zero value means the source did not advertise a bitrate.
@@ -80,9 +151,13 @@ playback timestamp without interrupting the video decoder or losing pause and
 volume state.
 
 The source factory creates two independent seekable cursors (audio and video).
+Session startup currently opens and probes the video cursor first so it can
+snapshot/select tracks, then opens and probes the audio cursor. These stages are
+intentionally serialized because the factory contract guarantees independent
+cursors but does not guarantee that concurrent factory calls are thread-safe.
 It therefore works with local files and with remote Range readers. Supported
-content is a seekable container recognized by the pinned FFmpeg build with
-H.264 video with optional AAC audio in a MOV/MP4 or Matroska container. CPU decoding is deliberately a compatibility path;
+content is a seekable container recognized by the pinned FFmpeg build with H.264
+video with optional AAC audio in a MOV/MP4 or Matroska container. CPU decoding is deliberately a compatibility path;
 resolution and frame-rate limits must be measured on hardware.
 
 ## Install and consume

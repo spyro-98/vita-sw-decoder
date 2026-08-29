@@ -31,6 +31,25 @@ static int first_audio_stream(const AVFormatContext *ctx) {
 	return -1;
 }
 
+static int64_t media_timeline_origin_us(const AVFormatContext *format) {
+	if (!format) return 0;
+	if (format->start_time != AV_NOPTS_VALUE) return format->start_time;
+	int64_t earliest = AV_NOPTS_VALUE;
+	for (unsigned int i = 0; i < format->nb_streams; i++) {
+		const AVStream *stream = format->streams[i];
+		if (stream->start_time == AV_NOPTS_VALUE ||
+		    stream->time_base.num <= 0 || stream->time_base.den <= 0 ||
+		    (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+		     stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+		     stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) ||
+		    (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+		int64_t value = av_rescale_q(stream->start_time, stream->time_base,
+		                             AV_TIME_BASE_Q);
+		if (earliest == AV_NOPTS_VALUE || value < earliest) earliest = value;
+	}
+	return earliest == AV_NOPTS_VALUE ? 0 : earliest;
+}
+
 static int parse_adts_header(const uint8_t *data, size_t size,
 	                         uint32_t *channels, uint32_t *sample_rate) {
 	static const uint32_t rates[13] = {
@@ -77,6 +96,8 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	AVPacket *packet = av_packet_alloc();
 	if (!packet) {
 		st->had_error = 1;
+		__sync_synchronize();
+		st->thread_done = 1;
 		return 0;
 	}
 
@@ -84,6 +105,44 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	const AVRational us_tb = { 1, 1000000 };
 	int decode_attempts = 0;
 	int last_applied_volume = -1;
+	int have_packet = 0;
+	/* Prime one selected AU while output is still gated. Besides overlapping the
+	 * demux read with video startup, this gives a track-switch transaction an exact
+	 * readiness point: clean EOF here means the requested track has no audio at the
+	 * current media position and must not be committed. */
+	while (!*st->cancel && !st->stop && !have_packet) {
+		int ret = read_audio_packet(st, packet);
+		if (ret == 0) {
+			__sync_synchronize();
+			st->eof = 1;
+			goto done;
+		}
+		if (ret < 0) {
+			if (!*st->cancel && !st->stop) {
+				log_printf("elementary_audio: initial av_read_frame -> %d", ret);
+				st->had_error = 1;
+			}
+			goto done;
+		}
+		if (st->initial_position_ms > 0) {
+			int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+			int64_t pts_us = pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+			               : av_rescale_q(pts, stream_tb, us_tb) -
+			                     st->timeline_origin_us;
+			int64_t pts_ms = pts_us == AV_NOPTS_VALUE ? -1 : pts_us / 1000;
+			if (pts_ms < 0 || (uint64_t)pts_ms < st->initial_position_ms) {
+				av_packet_unref(packet);
+				continue;
+			}
+			log_printf("elementary_audio: resume AU=%lld ms requested=%llu ms",
+			           (long long)pts_ms,
+			           (unsigned long long)st->initial_position_ms);
+			st->initial_position_ms = 0;
+		}
+		have_packet = 1;
+		__sync_synchronize();
+		st->first_packet_ready = 1;
+	}
 	while (st->start_gate && !*st->start_gate && !*st->cancel && !st->stop)
 		sceKernelDelayThread(1000);
 
@@ -107,33 +166,25 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			continue;
 		}
 
-		int ret = read_audio_packet(st, packet);
-		if (ret == 0) {
-			st->eof = 1;
-			break;
-		}
-		if (ret < 0) {
-			/* If cancel is already raised, the error is almost certainly the
-			 * interrupt_callback abort: it is not a decode failure, so we
-			 * exit cleanly without had_error. */
-			if (!*st->cancel && !st->stop) {
-				log_printf("elementary_audio: av_read_frame -> %d", ret);
-				st->had_error = 1;
+		if (have_packet) {
+			have_packet = 0;
+		} else {
+			int ret = read_audio_packet(st, packet);
+			if (ret == 0) {
+				__sync_synchronize();
+				st->eof = 1;
+				break;
 			}
-			break;
-		}
-		if (st->initial_position_ms > 0) {
-			int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
-			int64_t pts_ms = pts == AV_NOPTS_VALUE ? -1
-			               : av_rescale_q(pts, stream_tb, (AVRational){ 1, 1000 });
-			if (pts_ms < 0 || (uint64_t)pts_ms < st->initial_position_ms) {
-				av_packet_unref(packet);
-				continue;
+			if (ret < 0) {
+				/* If cancel is already raised, the error is almost certainly the
+				 * interrupt_callback abort: it is not a decode failure, so we
+				 * exit cleanly without had_error. */
+				if (!*st->cancel && !st->stop) {
+					log_printf("elementary_audio: av_read_frame -> %d", ret);
+					st->had_error = 1;
+				}
+				break;
 			}
-			log_printf("elementary_audio: resume AU=%lld ms requested=%llu ms",
-			           (long long)pts_ms,
-			           (unsigned long long)st->initial_position_ms);
-			st->initial_position_ms = 0;
 		}
 
 		VitaAacDecodedAudio decoded;
@@ -197,7 +248,9 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			}
 		}
 		int64_t pts_us = pts != AV_NOPTS_VALUE
-		               ? av_rescale_q(pts, stream_tb, us_tb) : AV_NOPTS_VALUE;
+		               ? av_rescale_q(pts, stream_tb, us_tb) -
+		                     st->timeline_origin_us
+		               : AV_NOPTS_VALUE;
 		for (uint32_t offset = 0; offset < decoded.frames;
 		     offset += ELEMENTARY_AUDIO_GRAIN) {
 			while (st->paused && !*st->cancel && !st->stop)
@@ -224,7 +277,10 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		if (st->had_error || *st->cancel || st->stop) break;
 	}
 
+done:
 	av_packet_free(&packet);
+	__sync_synchronize();
+	st->thread_done = 1;
 	return 0;
 }
 
@@ -240,6 +296,7 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 	st->cancel = cancel;
 	st->start_gate = start_gate;
 	st->initial_position_ms = initial_position_ms;
+	st->timeline_origin_us = media_timeline_origin_us(demux);
 	st->volume_percent = 100;
 
 	if (stream_index < 0) stream_index = first_audio_stream(demux);

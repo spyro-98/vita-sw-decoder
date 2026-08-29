@@ -21,6 +21,10 @@ typedef struct {
 	volatile int *start_gate;  /* decoder is ready, output starts only on GO */
 	volatile int had_error;
 	volatile int eof;
+	/* Published before the start gate opens once the worker has retained an AU at
+	 * or after initial_position_ms. Track replacement can therefore reject an
+	 * empty tail without allowing the new AudioOut cursor to become live. */
+	volatile int first_packet_ready;
 	/* ARM32 can publish a 32-bit millisecond clock atomically; the previous
 	 * volatile uint64_t could tear between the audio and render threads. */
 	volatile uint32_t played_until_ms;
@@ -31,11 +35,13 @@ typedef struct {
 	volatile int stop;         /* restart only this audio pipeline */
 	volatile int volume_percent; /* shared 0..300 perceived volume */
 	uint64_t initial_position_ms; /* progressive restart: discard earlier AUs */
+	int64_t timeline_origin_us;   /* common container origin, preserves A/V offset */
 	int port;
 	SceUID thid;
 	int decoder_ready; /* guard for vita_sw_aac_decoder_term(), see elementary_audio.c */
 	int port_open;      /* guard for sceAudioOutReleasePort() */
 	int started;        /* guard for sceKernelWaitThreadEnd()/DeleteThread() */
+	volatile int thread_done; /* cooperative-stop grace before transport abort */
 } ElementaryAudioState;
 
 /* Finds the first audio track in `demux` (if stream_index < 0) or uses the

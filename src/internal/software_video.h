@@ -67,7 +67,8 @@ typedef struct {
 	int continuous_high_fps;
 	int queue_capacity;
 	uint64_t initial_position_ms;
-	int initial_keyframe_found;
+	int64_t timeline_origin_us;
+	int initial_preroll_complete;
 
 	SoftwareVideoFrameSlot slots[SOFTWARE_VIDEO_FRAME_SLOTS];
 	SoftwareVideoZeroSurface zero_surfaces[SOFTWARE_VIDEO_ZERO_COPY_SURFACES];
@@ -113,6 +114,10 @@ typedef struct {
 	volatile int init_result;
 	volatile int thread_done;
 	int started;
+	/* Set only after a restart join has stopped the worker and the caller has
+	 * guaranteed that GXM no longer references any slot. The next same-size
+	 * start may reuse the CDRAM/AVFrame pool instead of reallocating it. */
+	int buffers_retained;
 } SoftwareVideoState;
 
 typedef struct SoftwareVideoDebugSnapshot {
@@ -145,6 +150,11 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	                     volatile int *start_gate);
 
 void vita_sw_software_video_join(SoftwareVideoState *st);
+
+/* These variants never call vita2d_wait_rendering_done(). The decoder may use
+ * them only after its owner has fenced/quiesced all rendering for this player. */
+void vita_sw_software_video_join_for_restart(SoftwareVideoState *st);
+void vita_sw_software_video_join_after_gpu_fence(SoftwareVideoState *st);
 
 /* Call between vita2d_start_drawing() and vita2d_end_drawing(). */
 int vita_sw_software_video_present(SoftwareVideoState *st,
