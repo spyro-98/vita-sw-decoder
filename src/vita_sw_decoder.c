@@ -28,6 +28,7 @@
 #define VITA_SW_DECODER_IO_STOP_GRACE_US (30ULL * 1000ULL)
 #define VITA_SW_DECODER_AUDIO_START_THREAD_PRIORITY 0x10000100
 #define VITA_SW_DECODER_AUDIO_START_THREAD_STACK 0x40000
+#define VITA_SW_DECODER_SEEK_OVERSHOOT_US (2ULL * 1000ULL * 1000ULL)
 
 typedef struct {
 	VitaSwDecoderStreamHandle stream;
@@ -844,11 +845,16 @@ static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 	int64_t target = av_rescale_q(
 	    logical_us + media_timeline_origin_us(input->format),
 	    AV_TIME_BASE_Q, stream->time_base);
-	int ret = avformat_seek_file(input->format, stream_index, INT64_MIN,
-	                             target, target, AVSEEK_FLAG_BACKWARD);
+	/* A Matroska file can carry subtitles, attachments and an MJPEG cover in
+	 * addition to H.264. avformat_seek_file() considers every active stream and
+	 * may select a later cluster that satisfies those sparse tracks. Prefer the
+	 * explicitly selected stream's preceding random-access point; retain the
+	 * multi-stream API only as a compatibility fallback. */
+	int ret = av_seek_frame(input->format, stream_index, target,
+	                        AVSEEK_FLAG_BACKWARD);
 	if (ret < 0)
-		ret = av_seek_frame(input->format, stream_index, target,
-		                    AVSEEK_FLAG_BACKWARD);
+		ret = avformat_seek_file(input->format, stream_index, INT64_MIN,
+		                         target, target, AVSEEK_FLAG_BACKWARD);
 	if (ret >= 0) avformat_flush(input->format);
 	return ret;
 }
@@ -1104,7 +1110,9 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		sceKernelDelayThread(1000);
 	}
 	__sync_synchronize();
-	vita_sw_software_video_buffer_status(&player->video, &ready, NULL, NULL);
+	uint64_t first_ready_pts_us = 0;
+	vita_sw_software_video_buffer_status(&player->video, &ready, NULL,
+	                                     &first_ready_pts_us);
 	if (*player->cancel) return AVERROR_EXIT;
 	if (!ready && player->video.had_error) {
 		log_printf("decoder seek: stage=first-frame ready=0 ret=%d cause=video-error\n",
@@ -1120,6 +1128,18 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		log_printf("decoder seek: stage=first-frame ready=0 ret=%d cause=timeout\n",
 		           AVERROR(ETIMEDOUT));
 		return AVERROR(ETIMEDOUT);
+	}
+	uint64_t requested_us = position_ms * 1000ULL;
+	if (first_ready_pts_us > requested_us +
+	                         VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+		/* Returning a checked failure invokes the existing fresh-session recovery.
+		 * Never release audio behind a frame several seconds in the future: that is
+		 * the black-screen state observed after a live seek. */
+		log_printf("decoder seek: invalid landing target=%llu ms frame=%llu ms overshoot=%llu ms; reopening\n",
+		           (unsigned long long)position_ms,
+		           (unsigned long long)(first_ready_pts_us / 1000ULL),
+		           (unsigned long long)((first_ready_pts_us - requested_us) / 1000ULL));
+		return AVERROR_INVALIDDATA;
 	}
 	player->start_gate = 1;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();

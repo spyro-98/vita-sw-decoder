@@ -1243,14 +1243,20 @@ void vita_sw_software_video_buffer_status(SoftwareVideoState *st, int *ready_fra
 	if (!st) return;
 	slots_lock(st);
 	int ready = 0;
-	for (int i = 0; i < st->queue_capacity; i++)
-		if (st->slots[i].state == SLOT_READY) ready++;
+	uint64_t earliest_ready_pts_us = UINT64_MAX;
+	for (int i = 0; i < st->queue_capacity; i++) {
+		if (st->slots[i].state != SLOT_READY) continue;
+		ready++;
+		if (st->slots[i].pts_us < earliest_ready_pts_us)
+			earliest_ready_pts_us = st->slots[i].pts_us;
+	}
 	if (ready_frames) *ready_frames = ready;
 	if (st->display_slot >= 0) {
 		if (have_display) *have_display = 1;
 		if (display_pts_us)
 			*display_pts_us = st->slots[st->display_slot].pts_us;
-	}
+	} else if (display_pts_us && earliest_ready_pts_us != UINT64_MAX)
+		*display_pts_us = earliest_ready_pts_us;
 	slots_unlock(st);
 }
 
