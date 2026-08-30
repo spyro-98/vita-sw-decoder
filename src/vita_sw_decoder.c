@@ -1249,6 +1249,15 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	player->duration_ms = input_duration_ms(player->video_input.format);
 	if (!player->duration_ms && player->has_audio)
 		player->duration_ms = input_duration_ms(player->audio_input.format);
+	if (!player->video_bitrate_bps && player->duration_ms > 0 &&
+	    player->video_input.stream.size > 0) {
+		uint64_t bytes = (uint64_t)player->video_input.stream.size;
+		/* Matroska frequently omits per-stream and container bitrate metadata.
+		 * Expose a useful average container rate instead of an empty HUD value. */
+		player->video_bitrate_bps = bytes <= UINT64_MAX / 8000ULL
+		                          ? bytes * 8000ULL / player->duration_ms
+		                          : bytes / player->duration_ms * 8000ULL;
+	}
 	uint64_t video_end_ms = stream_logical_end_ms(player->video_input.format,
 	                                             video_index);
 	uint64_t playable_end_ms = video_end_ms &&
