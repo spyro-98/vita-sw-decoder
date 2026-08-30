@@ -537,7 +537,7 @@ static int input_open(VitaSwDecoderInput *input,
 		return AVERROR(ENOMEM);
 	}
 	input->format->pb = input->avio;
-	input->format->flags |= AVFMT_FLAG_CUSTOM_IO;
+	input->format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_FAST_SEEK;
 	input->format->interrupt_callback.callback = interrupt_cb;
 	input->format->interrupt_callback.opaque = input;
 	input->deadline_us = sceKernelGetProcessTimeWide() +
@@ -585,11 +585,8 @@ static int input_open(VitaSwDecoderInput *input,
 			input->avio->error = 0;
 			input->avio->eof_reached = 0;
 		}
-		int resume_ret = avformat_seek_file(input->format, -1, INT64_MIN,
-		                                    0, 0, AVSEEK_FLAG_BACKWARD);
-		if (resume_ret < 0)
-			resume_ret = av_seek_frame(input->format, -1, 0,
-			                           AVSEEK_FLAG_BACKWARD);
+		int resume_ret = av_seek_frame(input->format, -1, 0,
+		                               AVSEEK_FLAG_BACKWARD);
 		if (resume_ret >= 0) {
 			avformat_flush(input->format);
 			log_printf("decoder input %s: probe deadline reached; usable streams repositioned\n",
@@ -841,8 +838,23 @@ static void isolate_input_stream(AVFormatContext *format, int stream_index) {
 
 static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 	                     uint64_t position_ms) {
-	if (!input || !input->format || stream_index < 0) return AVERROR(EINVAL);
+	if (!input || !input->format || stream_index < 0 ||
+	    (unsigned int)stream_index >= input->format->nb_streams)
+		return AVERROR(EINVAL);
 	if (input->abort_invoked) return AVERROR(EIO);
+	int seek_stream_index = stream_index;
+	AVStream *selected_stream = input->format->streams[stream_index];
+	if (selected_stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+	    (selected_stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+		/* Matroska commonly stores cue entries for the primary video track only.
+		 * Seeking an AAC stream directly makes libavformat walk clusters until it
+		 * reaches the requested timestamp. Always hop through the dense H.264 cue
+		 * index, then let the selected audio worker discard only the small GOP-sized
+		 * interleave margin. */
+		seek_stream_index = find_stream(input->format, AVMEDIA_TYPE_VIDEO,
+		                                AV_CODEC_ID_H264, 0);
+		if (seek_stream_index < 0) return AVERROR_STREAM_NOT_FOUND;
+	}
 	/* Custom AVIO keeps a prior AVERROR_EXIT/EOF latched across avio_seek(). A
 	 * cooperatively stopped, reusable cursor must clear those flags before the
 	 * mandatory demux seek; aborted cursors are rejected above and reopened. */
@@ -850,24 +862,25 @@ static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 		input->avio->error = 0;
 		input->avio->eof_reached = 0;
 	}
-	isolate_input_stream(input->format, stream_index);
-	AVStream *stream = input->format->streams[stream_index];
+	isolate_input_stream(input->format, seek_stream_index);
+	AVStream *stream = input->format->streams[seek_stream_index];
 	int64_t logical_us = av_rescale_q((int64_t)position_ms,
 	                                  (AVRational){ 1, 1000 }, AV_TIME_BASE_Q);
 	int64_t target = av_rescale_q(
 	    logical_us + media_timeline_origin_us(input->format),
 	    AV_TIME_BASE_Q, stream->time_base);
-	/* A Matroska file can carry subtitles, attachments and an MJPEG cover in
-	 * addition to H.264. avformat_seek_file() considers every active stream and
-	 * may select a later cluster that satisfies those sparse tracks. Prefer the
-	 * explicitly selected stream's preceding random-access point; retain the
-	 * multi-stream API only as a compatibility fallback. */
-	int ret = av_seek_frame(input->format, stream_index, target,
+	/* av_seek_frame on the video stream resolves a Matroska Cue/keyframe byte
+	 * offset. Do not fall back to avformat_seek_file or to the selected AAC
+	 * stream: either can degrade into a linear cluster scan. */
+	int ret = av_seek_frame(input->format, seek_stream_index, target,
 	                        AVSEEK_FLAG_BACKWARD);
-	if (ret < 0)
-		ret = avformat_seek_file(input->format, stream_index, INT64_MIN,
-		                         target, target, AVSEEK_FLAG_BACKWARD);
 	if (ret >= 0) avformat_flush(input->format);
+	/* Packet reading after the indexed hop belongs solely to the decoder worker
+	 * for the originally selected stream. */
+	isolate_input_stream(input->format, stream_index);
+	log_printf("decoder indexed hop: target=%llu ms anchor=%d selected=%d ret=%d\n",
+	           (unsigned long long)position_ms, seek_stream_index, stream_index,
+	           ret);
 	return ret;
 }
 
@@ -1157,9 +1170,10 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	}
 	player->start_gate = 1;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("decoder seek: join=%llu ms demux=%llu ms restart=%llu ms first-frame=%llu ms total=%llu ms ready=%d ret=0\n",
+	log_printf("decoder seek: join=%llu ms video-demux=%llu ms audio-demux=%llu ms restart=%llu ms first-frame=%llu ms total=%llu ms ready=%d ret=0\n",
 	           (unsigned long long)((joined_us - started_us) / 1000ULL),
-	           (unsigned long long)((demux_done_us - joined_us) / 1000ULL),
+	           (unsigned long long)((video_seek_done_us - joined_us) / 1000ULL),
+	           (unsigned long long)((demux_done_us - video_seek_done_us) / 1000ULL),
 	           (unsigned long long)((restarted_us - demux_done_us) / 1000ULL),
 	           (unsigned long long)((completed_us - restarted_us) / 1000ULL),
 	           (unsigned long long)((completed_us - started_us) / 1000ULL), ready);
