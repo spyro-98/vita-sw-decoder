@@ -59,6 +59,12 @@ The complete render loop is in `examples/local_file.c`.
   zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`;
   an ordinal outside the playable AAC snapshot is clamped to track zero during
   open so stale preferences cannot silently disable audio.
+- The 1024-frame AudioOut refill worker runs one scheduler priority above the
+  video worker. This protects its 21.3 ms deadline from H.264 bursts and UI/GXM
+  work without busy-spinning: demux reads and AudioOut submissions still block
+  normally. Shutdown diagnostics report submitted grains, delayed refills, and
+  the maximum wall-clock refill gap so intermittent stutter can be distinguished
+  from discontinuities in the source timestamps.
 - The already-open video demux snapshots up to 16 playable AAC tracks and 16
   embedded text-subtitle tracks (SubRip, ASS/SSA, WebVTT, MOV text, plain text,
   and MicroDVD) before decode starts. `vita_sw_decoder_*_track_count()` and
@@ -136,8 +142,8 @@ The complete render loop is in `examples/local_file.c`.
   returns `VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK` and the previous track
   remains live.
 - Concise timing records identify factory open, FFmpeg header/probe, startup
-  first-frame wait, demux seek, worker join/restart, and audio-switch latency in
-  the module log for on-device performance checks.
+  first-frame wait, demux seek, worker join/restart, audio-switch latency, and
+  AudioOut refill cadence in the module log for on-device performance checks.
 
 VitaMediaDeck can consume the decoder's immutable track-metadata snapshot while
 layering embedded text-subtitle packet demux, cover/frame previews, resume

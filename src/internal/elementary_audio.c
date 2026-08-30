@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include <psp2/audioout.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include <libavcodec/codec_par.h>
@@ -13,9 +14,12 @@
 
 #include "module_log.h"
 
-/* Audio output uses a dedicated raw Vita worker. The stack leaves headroom for
- * demux and hardware AAC calls without coupling the module to an app thread. */
-#define ELEMENTARY_AUDIO_THREAD_PRIORITY 0x10000100
+/* AudioOut has only one 1024-frame (~21.3 ms at 48 kHz) submission window.
+ * Run its combined read/decode/output worker one priority step above video so
+ * GXM presentation, UI animation, and H.264 bursts cannot starve the next
+ * grain. The worker blocks in AudioOut and transport reads, so this does not
+ * busy-spin at real-time priority. */
+#define ELEMENTARY_AUDIO_THREAD_PRIORITY 64
 #define ELEMENTARY_AUDIO_THREAD_STACK    0x40000
 /* Vita AudioOut grain used by the hardware AAC output loop. */
 #define ELEMENTARY_AUDIO_GRAIN 1024
@@ -106,6 +110,12 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	int decode_attempts = 0;
 	int last_applied_volume = -1;
 	int have_packet = 0;
+	uint64_t last_output_wall_us = 0;
+	uint64_t maximum_output_gap_us = 0;
+	unsigned int output_grains = 0;
+	unsigned int delayed_output_grains = 0;
+	log_printf("elementary_audio: thread priority=%d",
+	           sceKernelGetThreadCurrentPriority());
 	/* Prime one selected AU while output is still gated. Besides overlapping the
 	 * demux read with video startup, this gives a track-switch transaction an exact
 	 * readiness point: clean EOF here means the requested track has no audio at the
@@ -162,6 +172,7 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			/* No sceAudioOutOutput and no advancing of played_pts_us while
 			 * paused (SS5 point 5): the thread stays alive and rechecks the
 			 * state after a short interval. */
+			last_output_wall_us = 0;
 			sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
 			continue;
 		}
@@ -253,8 +264,10 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		               : AV_NOPTS_VALUE;
 		for (uint32_t offset = 0; offset < decoded.frames;
 		     offset += ELEMENTARY_AUDIO_GRAIN) {
-			while (st->paused && !*st->cancel && !st->stop)
+			while (st->paused && !*st->cancel && !st->stop) {
+				last_output_wall_us = 0;
 				sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
+			}
 			if (*st->cancel || st->stop) break;
 			const int16_t *grain = decoded.pcm + offset * st->decoder.channels;
 			int output_ret = sceAudioOutOutput(st->port, grain);
@@ -264,6 +277,23 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 				st->had_error = 1;
 				break;
 			}
+			uint64_t output_wall_us = sceKernelGetProcessTimeWide();
+			if (last_output_wall_us) {
+				uint64_t gap_us = output_wall_us - last_output_wall_us;
+				uint64_t expected_us =
+				    (uint64_t)ELEMENTARY_AUDIO_GRAIN * 1000000ULL /
+				    st->sample_rate;
+				if (gap_us > maximum_output_gap_us)
+					maximum_output_gap_us = gap_us;
+				/* Four milliseconds above the hardware grain is already enough
+				 * to be audible when no second submission is queued. Count it but
+				 * defer logging until shutdown so diagnostics cannot cause another
+				 * scheduling delay in the live output loop. */
+				if (gap_us > expected_us + 4000ULL)
+					delayed_output_grains++;
+			}
+			last_output_wall_us = output_wall_us;
+			output_grains++;
 
 			/* Publish only samples that AudioOut has accepted. */
 			if (pts_us >= 0) {
@@ -278,6 +308,10 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	}
 
 done:
+	if (output_grains)
+		log_printf("elementary_audio: cadence grains=%u delayed=%u gap_max=%llu us",
+		           output_grains, delayed_output_grains,
+		           (unsigned long long)maximum_output_gap_us);
 	av_packet_free(&packet);
 	__sync_synchronize();
 	st->thread_done = 1;
