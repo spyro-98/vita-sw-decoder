@@ -160,6 +160,12 @@ VitaMediaDeck can consume the decoder's immutable track-metadata snapshot while
 layering embedded text-subtitle packet demux, cover/frame previews, resume
 history, and player UI above this package.
 
+The current VitaMediaDeck integration uses the same H.264 cue anchor for an
+initial saved-position resume, a live seek, and AAC track replacement. Subtitle
+and thumbnail cursors remain app-owned and use independent cancellation
+generations, so restarting grid-cover work cannot invalidate the active media
+seek or playback cursor.
+
 ## Use both backends in one app
 
 `vita-sw-decoder` and `vita-hw-decoder` use the same lifecycle and stream
