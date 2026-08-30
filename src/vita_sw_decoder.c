@@ -828,6 +828,17 @@ static void close_session(VitaSwDecoderPlayer *player) {
 	player->local_cancel = 0;
 }
 
+static void isolate_input_stream(AVFormatContext *format, int stream_index) {
+	if (!format || stream_index < 0 ||
+	    (unsigned int)stream_index >= format->nb_streams) return;
+	/* Each playback cursor has exactly one job. Prevent Matroska from
+	 * packetizing alternate audio, subtitles, attachments and cover art while
+	 * it searches the cue/index and performs the short keyframe preroll. */
+	for (unsigned int i = 0; i < format->nb_streams; ++i)
+		format->streams[i]->discard = i == (unsigned int)stream_index
+		                          ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+}
+
 static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 	                     uint64_t position_ms) {
 	if (!input || !input->format || stream_index < 0) return AVERROR(EINVAL);
@@ -839,6 +850,7 @@ static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 		input->avio->error = 0;
 		input->avio->eof_reached = 0;
 	}
+	isolate_input_stream(input->format, stream_index);
 	AVStream *stream = input->format->streams[stream_index];
 	int64_t logical_us = av_rescale_q((int64_t)position_ms,
 	                                  (AVRational){ 1, 1000 }, AV_TIME_BASE_Q);
@@ -1048,13 +1060,15 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	input_clear_cancel_if_reusable(&player->video_input);
 	input_clear_cancel_if_reusable(&player->audio_input);
 	int ret = seek_input_ms(&player->video_input, video_index, position_ms);
+	uint64_t video_seek_done_us = sceKernelGetProcessTimeWide();
 	if (ret >= 0 && player->has_audio)
 		ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
 	uint64_t demux_done_us = sceKernelGetProcessTimeWide();
 	if (ret < 0) {
-		log_printf("decoder seek: stage=demux join=%llu ms demux=%llu ms total=%llu ms ret=%d\n",
+		log_printf("decoder seek: stage=demux join=%llu ms video-demux=%llu ms audio-demux=%llu ms total=%llu ms ret=%d\n",
 		           (unsigned long long)((joined_us - started_us) / 1000ULL),
-		           (unsigned long long)((demux_done_us - joined_us) / 1000ULL),
+		           (unsigned long long)((video_seek_done_us - joined_us) / 1000ULL),
+		           (unsigned long long)((demux_done_us - video_seek_done_us) / 1000ULL),
 		           (unsigned long long)((demux_done_us - started_us) / 1000ULL), ret);
 		return ret;
 	}
@@ -1215,6 +1229,9 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		}
 		player->has_audio = 1;
 	}
+	isolate_input_stream(player->video_input.format, video_index);
+	if (player->has_audio)
+		isolate_input_stream(player->audio_input.format, audio_index);
 	player->duration_ms = input_duration_ms(player->video_input.format);
 	if (!player->duration_ms && player->has_audio)
 		player->duration_ms = input_duration_ms(player->audio_input.format);
@@ -1232,9 +1249,17 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	}
 
 	if (start_position_ms > 0) {
+		uint64_t seek_started_us = sceKernelGetProcessTimeWide();
 		ret = seek_input_ms(&player->video_input, video_index, start_position_ms);
+		uint64_t video_seek_done_us = sceKernelGetProcessTimeWide();
 		if (ret >= 0 && player->has_audio)
 			ret = seek_input_ms(&player->audio_input, audio_index, start_position_ms);
+		uint64_t seek_done_us = sceKernelGetProcessTimeWide();
+		log_printf("decoder startup seek: target=%llu ms video=%llu ms audio=%llu ms total=%llu ms ret=%d\n",
+		           (unsigned long long)start_position_ms,
+		           (unsigned long long)((video_seek_done_us - seek_started_us) / 1000ULL),
+		           (unsigned long long)((seek_done_us - video_seek_done_us) / 1000ULL),
+		           (unsigned long long)((seek_done_us - seek_started_us) / 1000ULL), ret);
 		if (ret < 0) {
 			/* A stale history point must never turn startup into a linear decode
 			 * across a long file. Fall back to a checked beginning seek and report

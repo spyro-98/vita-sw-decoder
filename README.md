@@ -88,7 +88,11 @@ The complete render loop is in `examples/local_file.c`.
   counters, and dropped-frame counters are exposed through the public config and
   status structures. Runtime seeks reuse the open demuxers and first seek the
   selected H.264 stream backward, preventing sparse subtitle, attachment, or
-  cover tracks in Matroska from moving the demuxer to a later cluster. They
+  cover tracks in Matroska from moving the demuxer to a later cluster. Each
+  independent input now discards every stream except its selected H.264 or AAC
+  track before the index lookup and preroll, avoiding needless packetization of
+  alternate audio, subtitle, attachment, and cover streams. Startup and live
+  seek diagnostics report video- and audio-demux time separately. They
   feed that preceding keyframe and its
   dependent packets into H.264, and discard only decoded preroll pictures before
   publishing from the requested timestamp. Compressed reference packets are
