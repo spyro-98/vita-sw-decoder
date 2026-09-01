@@ -59,12 +59,13 @@ The complete render loop is in `examples/local_file.c`.
   zero-based audio ordinal comes from `VitaSwDecoderPlayerConfig.audio_track`;
   an ordinal outside the playable AAC snapshot is clamped to track zero during
   open so stale preferences cannot silently disable audio.
-- The 1024-frame AudioOut refill worker runs one scheduler priority above the
-  video worker. This protects its 21.3 ms deadline from H.264 bursts and UI/GXM
-  work without busy-spinning: demux reads and AudioOut submissions still block
-  normally. Shutdown diagnostics report submitted grains, delayed refills, and
-  the maximum wall-clock refill gap so intermittent stutter can be distinguished
-  from discontinuities in the source timestamps.
+- AAC demux/decode produces into a bounded eight-grain PCM ring. A dedicated
+  1024-frame AudioOut consumer runs one scheduler priority above the video
+  worker, so H.264, transport, and UI/GXM bursts cannot accumulate into audible
+  starvation. The consumer alone publishes the played clock after AudioOut has
+  accepted a grain; EOF is not exposed until every queued grain has drained.
+  Shutdown diagnostics report submitted grains, delayed refills, and the
+  maximum wall-clock refill gap.
 - The already-open video demux snapshots up to 16 playable AAC tracks and 16
   embedded text-subtitle tracks (SubRip, ASS/SSA, WebVTT, MOV text, plain text,
   and MicroDVD) before decode starts. `vita_sw_decoder_*_track_count()` and
@@ -113,9 +114,11 @@ The complete render loop is in `examples/local_file.c`.
   an audio-only session with an endless Preparing video state. Seek first-frame
   waits use a four-second CPU bound and fail cleanly if no picture is produced.
   A live seek also rejects a first ready frame more than two seconds beyond the
-  requested clock and invokes the checked fresh-session recovery, preventing
-  audio from running behind a black screen after an invalid demux landing.
-  If a selected audio stream reaches clean EOF before the
+  requested clock. Startup, resume, live seek, and audio-track replacement
+  retain the first AAC timestamp and require the first audio and video landings
+  to agree within 250 ms before the shared start gate opens. Invalid landings
+  invoke the checked fresh-session recovery instead of committing offset audio
+  or a black screen. If a selected audio stream reaches clean EOF before the
   video, clock ownership moves to the monotonic presentation clock without
   clearing the selected audio pipeline, so position remains continuous, the
   video tail drains, and a later seek can restart that same track. Hidden or

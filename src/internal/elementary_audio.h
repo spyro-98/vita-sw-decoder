@@ -9,6 +9,10 @@
 
 #include "internal/vita_aac_decoder.h"
 
+#define ELEMENTARY_AUDIO_RING_GRAINS 8
+#define ELEMENTARY_AUDIO_GRAIN_FRAMES 1024
+#define ELEMENTARY_AUDIO_MAX_CHANNELS 2
+
 /* Reads AAC packets from an AVFormatContext owned by the caller, decodes them
  * with sceAudiodec and sends PCM through blocking sceAudioOutOutput. The
  * submitted PTS is the player audio master clock. */
@@ -25,6 +29,11 @@ typedef struct {
 	 * or after initial_position_ms. Track replacement can therefore reject an
 	 * empty tail without allowing the new AudioOut cursor to become live. */
 	volatile int first_packet_ready;
+	/* Timestamp of the AU retained before the shared start gate opens. Seek
+	 * transactions use it to prevent stale audio from being released beside a
+	 * correctly repositioned video frame. */
+	volatile uint32_t first_packet_pts_ms;
+	volatile int first_packet_pts_valid;
 	/* ARM32 can publish a 32-bit millisecond clock atomically; the previous
 	 * volatile uint64_t could tear between the audio and render threads. */
 	volatile uint32_t played_until_ms;
@@ -38,6 +47,16 @@ typedef struct {
 	int64_t timeline_origin_us;   /* common container origin, preserves A/V offset */
 	int port;
 	SceUID thid;
+	SceUID output_thid;
+	/* The decoder producer stays ahead of the realtime AudioOut consumer. This
+	 * bounded ring prevents transport/decode bursts from opening audible gaps. */
+	int16_t *pcm_ring; /* 64-byte aligned AudioOut storage */
+	uint32_t pcm_end_ms[ELEMENTARY_AUDIO_RING_GRAINS];
+	uint8_t pcm_pts_valid[ELEMENTARY_AUDIO_RING_GRAINS];
+	volatile uint32_t pcm_write_seq;
+	volatile uint32_t pcm_read_seq;
+	volatile int producer_done;
+	int output_started;
 	int decoder_ready; /* guard for vita_sw_aac_decoder_term(), see elementary_audio.c */
 	int port_open;      /* guard for sceAudioOutReleasePort() */
 	int started;        /* guard for sceKernelWaitThreadEnd()/DeleteThread() */

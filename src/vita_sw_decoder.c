@@ -29,6 +29,7 @@
 #define VITA_SW_DECODER_AUDIO_START_THREAD_PRIORITY 0x10000100
 #define VITA_SW_DECODER_AUDIO_START_THREAD_STACK 0x40000
 #define VITA_SW_DECODER_SEEK_OVERSHOOT_US (2ULL * 1000ULL * 1000ULL)
+#define VITA_SW_DECODER_AV_LANDING_TOLERANCE_US (250ULL * 1000ULL)
 
 typedef struct {
 	VitaSwDecoderStreamHandle stream;
@@ -994,6 +995,15 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 		stop_audio_candidate(player);
 		return readiness_ret;
 	}
+	if (require_initial_packet && player->audio.first_packet_pts_valid &&
+	    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL >
+	        position_ms * 1000ULL + VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+		log_printf("decoder audio switch: invalid landing target=%llu ms audio=%u ms; rejecting\n",
+		           (unsigned long long)position_ms,
+		           player->audio.first_packet_pts_ms);
+		stop_audio_candidate(player);
+		return AVERROR_INVALIDDATA;
+	}
 	vita_sw_elementary_audio_set_volume(&player->audio,
 	                                    player->config.volume_percent);
 	player->audio.paused = player->paused;
@@ -1074,8 +1084,30 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	input_clear_cancel_if_reusable(&player->audio_input);
 	int ret = seek_input_ms(&player->video_input, video_index, position_ms);
 	uint64_t video_seek_done_us = sceKernelGetProcessTimeWide();
-	if (ret >= 0 && player->has_audio)
-		ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
+	if (ret >= 0 && player->has_audio) {
+		if (position_ms == 0) {
+			/* An indexed hop to absolute zero can report success while an
+			 * independent audio cursor remains on its previous Matroska cluster.
+			 * A fresh cursor is deterministic and this exceptional path is only
+			 * used for an actual restart from the beginning. */
+			input_close(&player->audio_input);
+			ret = player->cancel && *player->cancel ? AVERROR_EXIT
+			      : input_open(&player->audio_input, &player->config.stream,
+			                   player->cancel, "audio-zero-reopen", 0);
+			if (ret >= 0 &&
+			    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
+			     !playable_aac_stream(
+			         player->audio_input.format->streams[audio_index])))
+				ret = AVERROR_DECODER_NOT_FOUND;
+			if (ret >= 0) {
+				isolate_input_stream(player->audio_input.format, audio_index);
+				log_printf("decoder audio zero: reopened cursor selected=%d ret=0\n",
+				           audio_index);
+			}
+		} else {
+			ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
+		}
+	}
 	uint64_t demux_done_us = sceKernelGetProcessTimeWide();
 	if (ret < 0) {
 		log_printf("decoder seek: stage=demux join=%llu ms video-demux=%llu ms audio-demux=%llu ms total=%llu ms ret=%d\n",
@@ -1131,9 +1163,12 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	uint64_t deadline = restarted_us + 4000000ULL;
 	int ready = 0;
 	while (!*player->cancel && !player->video.had_error && !player->video.eof &&
+	       !(player->has_audio && player->audio.had_error) &&
 	       sceKernelGetProcessTimeWide() < deadline) {
 		vita_sw_software_video_buffer_status(&player->video, &ready, NULL, NULL);
-		if (ready >= 1) break;
+		int audio_ready = !player->has_audio || player->audio.first_packet_ready ||
+		                  player->audio.eof;
+		if (ready >= 1 && audio_ready) break;
 		sceKernelDelayThread(1000);
 	}
 	__sync_synchronize();
@@ -1156,6 +1191,15 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		           AVERROR(ETIMEDOUT));
 		return AVERROR(ETIMEDOUT);
 	}
+	if (player->has_audio && !player->audio.first_packet_ready &&
+	    !player->audio.eof) {
+		int audio_ret = player->audio.had_error ? AVERROR_INVALIDDATA
+		                : AVERROR(ETIMEDOUT);
+		log_printf("decoder seek: stage=first-audio target=%llu ms ret=%d eof=%d error=%d\n",
+		           (unsigned long long)position_ms, audio_ret,
+		           player->audio.eof, player->audio.had_error);
+		return audio_ret;
+	}
 	uint64_t requested_us = position_ms * 1000ULL;
 	if (first_ready_pts_us > requested_us +
 	                         VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
@@ -1168,15 +1212,41 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		           (unsigned long long)((first_ready_pts_us - requested_us) / 1000ULL));
 		return AVERROR_INVALIDDATA;
 	}
+	if (player->has_audio && player->audio.first_packet_pts_valid) {
+		uint64_t audio_pts_us =
+		    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL;
+		if (audio_pts_us > requested_us +
+		                   VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+			log_printf("decoder seek: invalid audio landing target=%llu ms audio=%u ms overshoot=%llu ms; reopening\n",
+			           (unsigned long long)position_ms,
+			           player->audio.first_packet_pts_ms,
+			           (unsigned long long)((audio_pts_us - requested_us) / 1000ULL));
+			return AVERROR_INVALIDDATA;
+		}
+		uint64_t landing_delta_us = audio_pts_us > first_ready_pts_us
+		                           ? audio_pts_us - first_ready_pts_us
+		                           : first_ready_pts_us - audio_pts_us;
+		if (landing_delta_us > VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+			log_printf("decoder seek: A/V landing mismatch target=%llu ms video=%llu ms audio=%u ms delta=%llu ms; reopening\n",
+			           (unsigned long long)position_ms,
+			           (unsigned long long)(first_ready_pts_us / 1000ULL),
+			           player->audio.first_packet_pts_ms,
+			           (unsigned long long)(landing_delta_us / 1000ULL));
+			return AVERROR_INVALIDDATA;
+		}
+	}
 	player->start_gate = 1;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("decoder seek: join=%llu ms video-demux=%llu ms audio-demux=%llu ms restart=%llu ms first-frame=%llu ms total=%llu ms ready=%d ret=0\n",
+	log_printf("decoder seek: join=%llu ms video-demux=%llu ms audio-demux=%llu ms restart=%llu ms first-frame=%llu ms total=%llu ms ready=%d video=%llu ms audio=%u ms audio-valid=%d ret=0\n",
 	           (unsigned long long)((joined_us - started_us) / 1000ULL),
 	           (unsigned long long)((video_seek_done_us - joined_us) / 1000ULL),
 	           (unsigned long long)((demux_done_us - video_seek_done_us) / 1000ULL),
 	           (unsigned long long)((restarted_us - demux_done_us) / 1000ULL),
 	           (unsigned long long)((completed_us - restarted_us) / 1000ULL),
-	           (unsigned long long)((completed_us - started_us) / 1000ULL), ready);
+	           (unsigned long long)((completed_us - started_us) / 1000ULL), ready,
+	           (unsigned long long)(first_ready_pts_us / 1000ULL),
+	           player->audio.first_packet_pts_ms,
+	           player->has_audio ? player->audio.first_packet_pts_valid : 0);
 	return 0;
 }
 
@@ -1328,13 +1398,18 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	uint64_t deadline = gate_started_us + 6000000ULL;
 	int ready = 0;
 	while (!*player->cancel && !player->video.had_error && !player->video.eof &&
+	       !(player->has_audio && player->audio.had_error) &&
 	       sceKernelGetProcessTimeWide() < deadline) {
 		vita_sw_software_video_buffer_status(&player->video, &ready, NULL, NULL);
-		if (ready >= 1) break;
+		int audio_ready = !player->has_audio || player->audio.first_packet_ready ||
+		                  player->audio.eof;
+		if (ready >= 1 && audio_ready) break;
 		sceKernelDelayThread(1000);
 	}
 	__sync_synchronize();
-	vita_sw_software_video_buffer_status(&player->video, &ready, NULL, NULL);
+	uint64_t first_ready_pts_us = 0;
+	vita_sw_software_video_buffer_status(&player->video, &ready, NULL,
+	                                     &first_ready_pts_us);
 	if (*player->cancel) { ret = AVERROR_EXIT; goto fail; }
 	if (!ready && player->video.had_error) {
 		ret = AVERROR_INVALIDDATA;
@@ -1354,12 +1429,51 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		           ret);
 		goto fail;
 	}
+	if (player->has_audio && !player->audio.first_packet_ready &&
+	    !player->audio.eof) {
+		ret = player->audio.had_error ? AVERROR_INVALIDDATA
+		      : AVERROR(ETIMEDOUT);
+		log_printf("decoder startup: stage=first-audio target=%llu ms ret=%d eof=%d error=%d\n",
+		           (unsigned long long)start_position_ms, ret,
+		           player->audio.eof, player->audio.had_error);
+		goto fail;
+	}
+	uint64_t requested_us = start_position_ms * 1000ULL;
+	if (first_ready_pts_us > requested_us +
+	                         VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+		ret = AVERROR_INVALIDDATA;
+		log_printf("decoder startup: invalid video landing target=%llu ms video=%llu ms\n",
+		           (unsigned long long)start_position_ms,
+		           (unsigned long long)(first_ready_pts_us / 1000ULL));
+		goto fail;
+	}
+	if (player->has_audio && player->audio.first_packet_pts_valid) {
+		uint64_t audio_pts_us =
+		    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL;
+		uint64_t landing_delta_us = audio_pts_us > first_ready_pts_us
+		                           ? audio_pts_us - first_ready_pts_us
+		                           : first_ready_pts_us - audio_pts_us;
+		if (audio_pts_us > requested_us +
+		                   VITA_SW_DECODER_SEEK_OVERSHOOT_US ||
+		    landing_delta_us > VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+			ret = AVERROR_INVALIDDATA;
+			log_printf("decoder startup: invalid A/V landing target=%llu ms video=%llu ms audio=%u ms delta=%llu ms\n",
+			           (unsigned long long)start_position_ms,
+			           (unsigned long long)(first_ready_pts_us / 1000ULL),
+			           player->audio.first_packet_pts_ms,
+			           (unsigned long long)(landing_delta_us / 1000ULL));
+			goto fail;
+		}
+	}
 	player->start_gate = 1;
 	player->opened = 1;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("decoder startup: first-frame=%llu ms total=%llu ms ready=%d ret=0\n",
+	log_printf("decoder startup: first-frame=%llu ms total=%llu ms ready=%d video=%llu ms audio=%u ms audio-valid=%d ret=0\n",
 	           (unsigned long long)((completed_us - gate_started_us) / 1000ULL),
-	           (unsigned long long)((completed_us - started_us) / 1000ULL), ready);
+	           (unsigned long long)((completed_us - started_us) / 1000ULL), ready,
+	           (unsigned long long)(first_ready_pts_us / 1000ULL),
+	           player->audio.first_packet_pts_ms,
+	           player->has_audio ? player->audio.first_packet_pts_valid : 0);
 	return 0;
 
 fail:

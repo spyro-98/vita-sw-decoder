@@ -1,5 +1,6 @@
 #include "internal/elementary_audio.h"
 
+#include <malloc.h>
 #include <string.h>
 
 #include <psp2/audioout.h>
@@ -14,15 +15,15 @@
 
 #include "module_log.h"
 
-/* AudioOut has only one 1024-frame (~21.3 ms at 48 kHz) submission window.
- * Run its combined read/decode/output worker one priority step above video so
- * GXM presentation, UI animation, and H.264 bursts cannot starve the next
- * grain. The worker blocks in AudioOut and transport reads, so this does not
- * busy-spin at real-time priority. */
-#define ELEMENTARY_AUDIO_THREAD_PRIORITY 64
+/* Keep the blocking AudioOut consumer above video and the demux/decode producer
+ * below it. The bounded PCM ring absorbs occasional transport and AAC decode
+ * stalls without making the hardware port wait for the next grain. */
+#define ELEMENTARY_AUDIO_OUTPUT_PRIORITY 64
+#define ELEMENTARY_AUDIO_THREAD_PRIORITY 66
 #define ELEMENTARY_AUDIO_THREAD_STACK    0x40000
+#define ELEMENTARY_AUDIO_OUTPUT_STACK    0x10000
 /* Vita AudioOut grain used by the hardware AAC output loop. */
-#define ELEMENTARY_AUDIO_GRAIN 1024
+#define ELEMENTARY_AUDIO_GRAIN ELEMENTARY_AUDIO_GRAIN_FRAMES
 /* Short wait while paused: it is not pacing, just to avoid spinning the CPU
  * while the thread stays alive without producing output. */
 #define ELEMENTARY_AUDIO_PAUSE_DELAY_US (10 * 1000)
@@ -93,6 +94,75 @@ static int read_audio_packet(ElementaryAudioState *st, AVPacket *packet) {
 	return st->stop ? AVERROR_EXIT : ret == AVERROR_EOF ? 0 : ret;
 }
 
+static int vita_sw_elementary_audio_output_thread(SceSize args, void *argp) {
+	(void)args;
+	ElementaryAudioState *st = *(ElementaryAudioState **)argp;
+	uint64_t last_output_wall_us = 0;
+	uint64_t maximum_output_gap_us = 0;
+	unsigned int output_grains = 0;
+	unsigned int delayed_output_grains = 0;
+	int last_applied_volume = -1;
+	log_printf("elementary_audio: output priority=%d ring=%d",
+	           sceKernelGetThreadCurrentPriority(), ELEMENTARY_AUDIO_RING_GRAINS);
+
+	while (st->start_gate && !*st->start_gate && !*st->cancel && !st->stop)
+		sceKernelDelayThread(1000);
+	while (!*st->cancel && !st->stop) {
+		if (st->paused) {
+			last_output_wall_us = 0;
+			sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
+			continue;
+		}
+		uint32_t read_seq = st->pcm_read_seq;
+		if (read_seq == st->pcm_write_seq) {
+			if (st->producer_done) break;
+			sceKernelDelayThread(1000);
+			continue;
+		}
+		int requested_volume = st->volume_percent;
+		if (requested_volume != last_applied_volume && st->port >= 0) {
+			last_applied_volume = requested_volume;
+			int hardware_percent = requested_volume > 100 ? 100 : requested_volume;
+			int hardware_volume = hardware_percent * SCE_AUDIO_VOLUME_0DB / 100;
+			int volume[2] = { hardware_volume, hardware_volume };
+			sceAudioOutSetVolume(st->port,
+			                      SCE_AUDIO_VOLUME_FLAG_L_CH |
+			                          SCE_AUDIO_VOLUME_FLAG_R_CH,
+			                      volume);
+		}
+		uint32_t slot = read_seq % ELEMENTARY_AUDIO_RING_GRAINS;
+		int16_t *grain = st->pcm_ring +
+		                 slot * ELEMENTARY_AUDIO_GRAIN *
+		                     ELEMENTARY_AUDIO_MAX_CHANNELS;
+		int output_ret = sceAudioOutOutput(st->port, grain);
+		if (output_ret < 0) {
+			log_printf("elementary_audio: sceAudioOutOutput -> 0x%08X",
+			           (unsigned)output_ret);
+			st->had_error = 1;
+			st->stop = 1;
+			break;
+		}
+		uint64_t output_wall_us = sceKernelGetProcessTimeWide();
+		if (last_output_wall_us) {
+			uint64_t gap_us = output_wall_us - last_output_wall_us;
+			uint64_t expected_us =
+			    (uint64_t)ELEMENTARY_AUDIO_GRAIN * 1000000ULL / st->sample_rate;
+			if (gap_us > maximum_output_gap_us) maximum_output_gap_us = gap_us;
+			if (gap_us > expected_us + 4000ULL) delayed_output_grains++;
+		}
+		last_output_wall_us = output_wall_us;
+		output_grains++;
+		if (st->pcm_pts_valid[slot]) st->played_until_ms = st->pcm_end_ms[slot];
+		__sync_synchronize();
+		st->pcm_read_seq = read_seq + 1;
+	}
+	if (output_grains)
+		log_printf("elementary_audio: cadence grains=%u delayed=%u gap_max=%llu us underrun_waits=buffered",
+		           output_grains, delayed_output_grains,
+		           (unsigned long long)maximum_output_gap_us);
+	return 0;
+}
+
 static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	(void)args;
 	ElementaryAudioState *st = *(ElementaryAudioState **)argp;
@@ -108,13 +178,9 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	const AVRational stream_tb = st->demux->streams[st->stream_index]->time_base;
 	const AVRational us_tb = { 1, 1000000 };
 	int decode_attempts = 0;
-	int last_applied_volume = -1;
 	int have_packet = 0;
-	uint64_t last_output_wall_us = 0;
-	uint64_t maximum_output_gap_us = 0;
-	unsigned int output_grains = 0;
-	unsigned int delayed_output_grains = 0;
-	log_printf("elementary_audio: thread priority=%d",
+	int reached_eof = 0;
+	log_printf("elementary_audio: producer priority=%d",
 	           sceKernelGetThreadCurrentPriority());
 	/* Prime one selected AU while output is still gated. Besides overlapping the
 	 * demux read with video startup, this gives a track-switch transaction an exact
@@ -134,47 +200,56 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			}
 			goto done;
 		}
-		if (st->initial_position_ms > 0) {
-			int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
-			int64_t pts_us = pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
-			               : av_rescale_q(pts, stream_tb, us_tb) -
-			                     st->timeline_origin_us;
-			int64_t pts_ms = pts_us == AV_NOPTS_VALUE ? -1 : pts_us / 1000;
-			if (pts_ms < 0 || (uint64_t)pts_ms < st->initial_position_ms) {
-				av_packet_unref(packet);
-				continue;
-			}
-			log_printf("elementary_audio: resume AU=%lld ms requested=%llu ms",
-			           (long long)pts_ms,
-			           (unsigned long long)st->initial_position_ms);
-			st->initial_position_ms = 0;
+		int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+		int64_t pts_us = pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+		               : av_rescale_q(pts, stream_tb, us_tb) -
+		                     st->timeline_origin_us;
+		int64_t pts_ms = pts_us == AV_NOPTS_VALUE ? -1 : pts_us / 1000;
+		uint64_t requested_ms = st->initial_position_ms;
+		if (requested_ms > 0 &&
+		    (pts_ms < 0 || (uint64_t)pts_ms < requested_ms)) {
+			av_packet_unref(packet);
+			continue;
 		}
+		if (pts_ms >= 0) {
+			st->first_packet_pts_ms = (uint64_t)pts_ms > UINT32_MAX
+			                         ? UINT32_MAX : (uint32_t)pts_ms;
+			st->first_packet_pts_valid = 1;
+		}
+		log_printf("elementary_audio: landing AU=%lld ms requested=%llu ms",
+		           (long long)pts_ms, (unsigned long long)requested_ms);
+		st->initial_position_ms = 0;
 		have_packet = 1;
-		__sync_synchronize();
-		st->first_packet_ready = 1;
 	}
-	while (st->start_gate && !*st->start_gate && !*st->cancel && !st->stop)
-		sceKernelDelayThread(1000);
+	if (*st->cancel || st->stop) goto done;
+	st->output_thid = sceKernelCreateThread(
+	    "VitaSwDecoderAudioOut", vita_sw_elementary_audio_output_thread,
+	    ELEMENTARY_AUDIO_OUTPUT_PRIORITY, ELEMENTARY_AUDIO_OUTPUT_STACK, 0, 0, NULL);
+	if (st->output_thid < 0) {
+		st->had_error = 1;
+		goto done;
+	}
+	void *output_self = st;
+	int output_start_ret = sceKernelStartThread(
+	    st->output_thid, sizeof(output_self), &output_self);
+	if (output_start_ret < 0) {
+		log_printf("elementary_audio: output start -> 0x%08X",
+		           (unsigned)output_start_ret);
+		sceKernelDeleteThread(st->output_thid);
+		st->output_thid = -1;
+		st->had_error = 1;
+		goto done;
+	}
+	st->output_started = 1;
+	__sync_synchronize();
+	st->first_packet_ready = 1;
 
 	while (!*st->cancel && !st->stop) {
 		int requested_volume = st->volume_percent;
-		if (requested_volume != last_applied_volume && st->port >= 0) {
-			last_applied_volume = requested_volume;
-			int hardware_percent = requested_volume > 100 ? 100 : requested_volume;
-			int hardware_volume = hardware_percent * SCE_AUDIO_VOLUME_0DB / 100;
-			int volume[2] = { hardware_volume, hardware_volume };
-			sceAudioOutSetVolume(st->port,
-			                      SCE_AUDIO_VOLUME_FLAG_L_CH |
-			                          SCE_AUDIO_VOLUME_FLAG_R_CH,
-			                      volume);
-		}
 		if (st->paused) {
-			/* No sceAudioOutOutput and no advancing of played_pts_us while
-			 * paused (SS5 point 5): the thread stays alive and rechecks the
-			 * state after a short interval. */
-			last_output_wall_us = 0;
+			/* Let the consumer own pause semantics; stop producing once the ring
+			 * is full so decoded PCM remains bounded and ordered. */
 			sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
-			continue;
 		}
 
 		if (have_packet) {
@@ -182,8 +257,10 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		} else {
 			int ret = read_audio_packet(st, packet);
 			if (ret == 0) {
-				__sync_synchronize();
-				st->eof = 1;
+				/* EOF belongs to the public playback clock only after AudioOut has
+				 * consumed every queued grain. Otherwise video and subtitles would
+				 * hand off to wall time while buffered audio is still playing. */
+				reached_eof = 1;
 				break;
 			}
 			if (ret < 0) {
@@ -264,54 +341,46 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 		               : AV_NOPTS_VALUE;
 		for (uint32_t offset = 0; offset < decoded.frames;
 		     offset += ELEMENTARY_AUDIO_GRAIN) {
-			while (st->paused && !*st->cancel && !st->stop) {
-				last_output_wall_us = 0;
-				sceKernelDelayThread(ELEMENTARY_AUDIO_PAUSE_DELAY_US);
-			}
+			while (st->pcm_write_seq - st->pcm_read_seq >=
+			           ELEMENTARY_AUDIO_RING_GRAINS &&
+			       !*st->cancel && !st->stop)
+				sceKernelDelayThread(1000);
 			if (*st->cancel || st->stop) break;
-			const int16_t *grain = decoded.pcm + offset * st->decoder.channels;
-			int output_ret = sceAudioOutOutput(st->port, grain);
-			if (output_ret < 0) {
-				log_printf("elementary_audio: sceAudioOutOutput -> 0x%08X",
-				          (unsigned)output_ret);
-				st->had_error = 1;
-				break;
-			}
-			uint64_t output_wall_us = sceKernelGetProcessTimeWide();
-			if (last_output_wall_us) {
-				uint64_t gap_us = output_wall_us - last_output_wall_us;
-				uint64_t expected_us =
-				    (uint64_t)ELEMENTARY_AUDIO_GRAIN * 1000000ULL /
-				    st->sample_rate;
-				if (gap_us > maximum_output_gap_us)
-					maximum_output_gap_us = gap_us;
-				/* Four milliseconds above the hardware grain is already enough
-				 * to be audible when no second submission is queued. Count it but
-				 * defer logging until shutdown so diagnostics cannot cause another
-				 * scheduling delay in the live output loop. */
-				if (gap_us > expected_us + 4000ULL)
-					delayed_output_grains++;
-			}
-			last_output_wall_us = output_wall_us;
-			output_grains++;
-
-			/* Publish only samples that AudioOut has accepted. */
+			uint32_t write_seq = st->pcm_write_seq;
+			uint32_t slot = write_seq % ELEMENTARY_AUDIO_RING_GRAINS;
+			int16_t *ring_grain = st->pcm_ring +
+			                      slot * ELEMENTARY_AUDIO_GRAIN *
+			                          ELEMENTARY_AUDIO_MAX_CHANNELS;
+			memcpy(ring_grain,
+			       decoded.pcm + offset * st->decoder.channels,
+			       ELEMENTARY_AUDIO_GRAIN * st->decoder.channels * sizeof(int16_t));
+			st->pcm_pts_valid[slot] = pts_us >= 0;
 			if (pts_us >= 0) {
 				uint64_t end_us = (uint64_t)pts_us +
 				    (uint64_t)(offset + ELEMENTARY_AUDIO_GRAIN) * 1000000ULL /
 				    st->sample_rate;
-				st->played_until_ms = end_us / 1000ULL > UINT32_MAX
-				                         ? UINT32_MAX : (uint32_t)(end_us / 1000ULL);
+				st->pcm_end_ms[slot] = end_us / 1000ULL > UINT32_MAX
+				                     ? UINT32_MAX : (uint32_t)(end_us / 1000ULL);
 			}
+			__sync_synchronize();
+			st->pcm_write_seq = write_seq + 1;
 		}
 		if (st->had_error || *st->cancel || st->stop) break;
 	}
 
 done:
-	if (output_grains)
-		log_printf("elementary_audio: cadence grains=%u delayed=%u gap_max=%llu us",
-		           output_grains, delayed_output_grains,
-		           (unsigned long long)maximum_output_gap_us);
+	__sync_synchronize();
+	st->producer_done = 1;
+	if (st->output_started && st->output_thid >= 0) {
+		sceKernelWaitThreadEnd(st->output_thid, NULL, NULL);
+		sceKernelDeleteThread(st->output_thid);
+		st->output_thid = -1;
+		st->output_started = 0;
+	}
+	if (reached_eof && !st->had_error && !*st->cancel && !st->stop) {
+		__sync_synchronize();
+		st->eof = 1;
+	}
 	av_packet_free(&packet);
 	__sync_synchronize();
 	st->thread_done = 1;
@@ -326,6 +395,7 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 	memset(st, 0, sizeof(*st));
 	st->port = -1;
 	st->thid = -1;
+	st->output_thid = -1;
 	st->demux = demux;
 	st->cancel = cancel;
 	st->start_gate = start_gate;
@@ -378,6 +448,15 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 		return -1;
 	}
 	st->sample_rate = sample_rate;
+	size_t ring_bytes = ELEMENTARY_AUDIO_RING_GRAINS *
+	                    ELEMENTARY_AUDIO_GRAIN *
+	                    ELEMENTARY_AUDIO_MAX_CHANNELS * sizeof(int16_t);
+	st->pcm_ring = memalign(64, ring_bytes);
+	if (!st->pcm_ring) {
+		av_packet_free(&st->prefetched_packet);
+		return AVERROR(ENOMEM);
+	}
+	memset(st->pcm_ring, 0, ring_bytes);
 
 	/* SBR state is selected inside vita_sw_aac_decoder_init_ex. A future decoder
 	 * revision can parse the complete AudioSpecificConfig when required. */
@@ -386,6 +465,8 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 	if (ret < 0) {
 		log_printf("elementary_audio: vita_sw_aac_decoder_init -> 0x%08X", (unsigned)ret);
 		av_packet_free(&st->prefetched_packet);
+		free(st->pcm_ring);
+		st->pcm_ring = NULL;
 		return ret;
 	}
 	st->decoder_ready = 1;
@@ -400,6 +481,8 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 		vita_sw_aac_decoder_term(&st->decoder);
 		st->decoder_ready = 0;
 		av_packet_free(&st->prefetched_packet);
+		free(st->pcm_ring);
+		st->pcm_ring = NULL;
 		return port;
 	}
 	st->port = port;
@@ -419,6 +502,8 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 		vita_sw_aac_decoder_term(&st->decoder);
 		st->decoder_ready = 0;
 		av_packet_free(&st->prefetched_packet);
+		free(st->pcm_ring);
+		st->pcm_ring = NULL;
 		return ret;
 	}
 
@@ -434,6 +519,8 @@ int vita_sw_elementary_audio_start(ElementaryAudioState *st, AVFormatContext *de
 		vita_sw_aac_decoder_term(&st->decoder);
 		st->decoder_ready = 0;
 		av_packet_free(&st->prefetched_packet);
+		free(st->pcm_ring);
+		st->pcm_ring = NULL;
 		return ret;
 	}
 
@@ -464,6 +551,8 @@ void vita_sw_elementary_audio_join(ElementaryAudioState *st) {
 	}
 	if (st->started && st->thid >= 0) sceKernelDeleteThread(st->thid);
 	av_packet_free(&st->prefetched_packet);
+	free(st->pcm_ring);
+	st->pcm_ring = NULL;
 	st->thid = -1;
 	st->port = -1;
 	st->started = 0;
