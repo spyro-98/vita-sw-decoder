@@ -64,6 +64,8 @@ typedef struct VitaSwDecoderPlayerConfig {
 	/* Optional cooperative cancellation flag used during remote opens and
 	 * decode. The caller must keep it alive until close returns. */
 	volatile int *cancel_flag;
+	/* Applied before releasing the audio start gate. */
+	int start_paused;
 } VitaSwDecoderPlayerConfig;
 
 typedef struct VitaSwDecoderPlayerStatus {

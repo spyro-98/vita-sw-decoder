@@ -1079,6 +1079,20 @@ int vita_sw_software_video_present_rect(SoftwareVideoState *st,
 			newest_due_pts_us = slot->pts_us;
 		}
 	}
+	/* A paused open/seek has no displayed surface yet. Latch one landing frame
+	 * without advancing either clock; subsequent paused draws retain it. */
+	if (!allow_advance && st->display_slot < 0) {
+		for (int i = 0; i < st->queue_capacity; i++) {
+			SoftwareVideoFrameSlot *slot = &st->slots[i];
+			if (slot->state != SLOT_READY) continue;
+			if (selected < 0 || slot->pts_us < oldest_due_pts_us ||
+			    (slot->pts_us == oldest_due_pts_us && slot->serial < selected_serial)) {
+				selected = i;
+				selected_serial = slot->serial;
+				oldest_due_pts_us = slot->pts_us;
+			}
+		}
+	}
 	if (st->continuous_high_fps && selected >= 0 && newest_due >= 0 &&
 	    audio_clock_us > st->slots[selected].pts_us + 40000ULL) {
 		selected = newest_due;

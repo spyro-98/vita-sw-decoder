@@ -618,21 +618,19 @@ static int input_open(VitaSwDecoderInput *input,
 	return 0;
 }
 
-static int ensure_audio_input_reusable(VitaSwDecoderPlayer *player,
-	                                   volatile int *operation_cancel) {
+static int reopen_audio_input(VitaSwDecoderPlayer *player,
+	                          volatile int *operation_cancel,
+	                          const char *label) {
 	if (!player) return AVERROR(EINVAL);
-	if (player->audio_input.format && !player->audio_input.abort_invoked) {
-		input_clear_cancel_if_reusable(&player->audio_input);
-		return 0;
-	}
 	if (audio_operation_cancelled(player, operation_cancel)) return AVERROR_EXIT;
-	/* An invoked abort is allowed to tear down the transport while preserving
-	 * cursor ownership. Close that cursor exactly once, then obtain a fresh
-	 * independent audio cursor before any FFmpeg seek/read reuses it. */
+	/* Every timeline discontinuity gets a new independent audio cursor. A clean
+	 * worker stop does not guarantee that libavformat discarded an internally
+	 * buffered EOF/cluster position, and av_seek_frame() may still report success
+	 * on that stale cursor while the replacement worker receives no AU. */
 	input_close(&player->audio_input);
 	if (audio_operation_cancelled(player, operation_cancel)) return AVERROR_EXIT;
 	return input_open(&player->audio_input, &player->config.stream,
-	                  player->cancel, "audio-reopen", 0);
+	                  player->cancel, label ? label : "audio-reopen", 0);
 }
 
 static void stop_audio_candidate(VitaSwDecoderPlayer *player);
@@ -792,6 +790,17 @@ static uint64_t stream_logical_end_ms(const AVFormatContext *format,
 	return (logical_end_us + 999ULL) / 1000ULL;
 }
 
+static int audio_eof_expected_at(const VitaSwDecoderPlayer *player,
+	                             int audio_index, uint64_t position_ms) {
+	if (!player) return 0;
+	uint64_t end_ms = stream_logical_end_ms(player->audio_input.format,
+	                                       audio_index);
+	if (!end_ms) end_ms = player->duration_ms;
+	if (!end_ms || position_ms >= end_ms) return end_ms != 0;
+	uint64_t remaining_ms = end_ms - position_ms;
+	return remaining_ms <= VITA_SW_DECODER_SEEK_OVERSHOOT_US / 1000ULL;
+}
+
 static void close_session(VitaSwDecoderPlayer *player) {
 	if (!player) return;
 	player->video.stop = 1;
@@ -924,18 +933,13 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	player->clock_started = 1;
 	if (audio_operation_cancelled(player, operation_cancel))
 		return AVERROR_EXIT;
-	int ret = ensure_audio_input_reusable(player, operation_cancel);
-	if (ret < 0) return ret;
-	if (audio_operation_cancelled(player, operation_cancel))
-		return AVERROR_EXIT;
-
 	int audio_index = audio_track >= 0 &&
 	                          audio_track < player->audio_track_count
 	                    ? player->audio_tracks[audio_track].stream_index : -1;
 	if (audio_index >= 0 &&
-	    (!player->audio_input.format ||
-	     (unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-	     !playable_aac_stream(player->audio_input.format->streams[audio_index])))
+	    (!player->video_input.format ||
+	     (unsigned int)audio_index >= player->video_input.format->nb_streams ||
+	     !playable_aac_stream(player->video_input.format->streams[audio_index])))
 		audio_index = -1;
 	if (audio_index < 0) {
 		log_printf("decoder audio switch: join=%llu ms total=%llu ms ret=%d\n",
@@ -944,7 +948,16 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 		                                1000ULL), AVERROR_DECODER_NOT_FOUND);
 		return AVERROR_DECODER_NOT_FOUND;
 	}
-	ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
+	int ret = reopen_audio_input(player, operation_cancel,
+	                             "audio-track-reopen");
+	if (ret >= 0 &&
+	    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
+	     !playable_aac_stream(player->audio_input.format->streams[audio_index])))
+		ret = AVERROR_DECODER_NOT_FOUND;
+	if (ret >= 0 && position_ms > 0)
+		ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
+	else if (ret >= 0)
+		isolate_input_stream(player->audio_input.format, audio_index);
 	uint64_t seek_done_us = sceKernelGetProcessTimeWide();
 	if (audio_operation_cancelled(player, operation_cancel))
 		return AVERROR_EXIT;
@@ -997,10 +1010,11 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	}
 	if (require_initial_packet && player->audio.first_packet_pts_valid &&
 	    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL >
-	        position_ms * 1000ULL + VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
-		log_printf("decoder audio switch: invalid landing target=%llu ms audio=%u ms; rejecting\n",
+	        position_ms * 1000ULL + VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+		log_printf("decoder audio switch: invalid landing target=%llu ms audio=%u ms tolerance=%u ms; rejecting\n",
 		           (unsigned long long)position_ms,
-		           player->audio.first_packet_pts_ms);
+		           player->audio.first_packet_pts_ms,
+		           (unsigned)(VITA_SW_DECODER_AV_LANDING_TOLERANCE_US / 1000ULL));
 		stop_audio_candidate(player);
 		return AVERROR_INVALIDDATA;
 	}
@@ -1008,12 +1022,13 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	                                    player->config.volume_percent);
 	player->audio.paused = player->paused;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
-	log_printf("decoder audio switch: join=%llu ms demux=%llu ms restart=%llu ms total=%llu ms ret=0 track=%d\n",
+	log_printf("decoder audio switch: join=%llu ms demux=%llu ms restart=%llu ms total=%llu ms ret=0 track=%d stream=%d audio=%u ms audio-valid=%d\n",
 	           (unsigned long long)((joined_us - started_us) / 1000ULL),
 	           (unsigned long long)((seek_done_us - joined_us) / 1000ULL),
 	           (unsigned long long)((completed_us - seek_done_us) / 1000ULL),
 	           (unsigned long long)((completed_us - started_us) / 1000ULL),
-	           audio_track);
+	           audio_track, audio_index, player->audio.first_packet_pts_ms,
+	           player->audio.first_packet_pts_valid);
 	return 0;
 }
 
@@ -1038,9 +1053,9 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	                    ? player->audio_tracks[player->config.audio_track].stream_index
 	                    : -1;
 	if (audio_index >= 0 &&
-	    (!player->audio_input.format ||
-	     (unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-	     !playable_aac_stream(player->audio_input.format->streams[audio_index])))
+	    (!player->video_input.format ||
+	     (unsigned int)audio_index >= player->video_input.format->nb_streams ||
+	     !playable_aac_stream(player->video_input.format->streams[audio_index])))
 		audio_index = -1;
 	if (video_index < 0 || (player->has_audio && audio_index < 0)) {
 		log_printf("decoder seek: stage=streams total=%llu ms ret=%d\n",
@@ -1070,43 +1085,28 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		vita_sw_elementary_audio_join(&player->audio);
 	uint64_t joined_us = sceKernelGetProcessTimeWide();
 	if (player->cancel && *player->cancel) return AVERROR_EXIT;
-	if (player->video_input.abort_invoked ||
-	    player->audio_input.abort_invoked) {
-		/* abort may shut down the transport (SFTP/SMB do). Leave both cursors
-		 * cancelled and force the caller's checked full-session reopen rather than
-		 * seeking an AVFormatContext backed by a poisoned cursor. */
+	if (player->video_input.abort_invoked) {
+		/* The video cursor must remain seekable in-place. The audio cursor is always
+		 * closed and reopened below, so an abort there is recoverable locally. */
 		log_printf("decoder seek: stage=join cursor-aborted video=%d audio=%d ret=%d\n",
 		           player->video_input.abort_invoked,
 		           player->audio_input.abort_invoked, AVERROR(EIO));
 		return AVERROR(EIO);
 	}
 	input_clear_cancel_if_reusable(&player->video_input);
-	input_clear_cancel_if_reusable(&player->audio_input);
 	int ret = seek_input_ms(&player->video_input, video_index, position_ms);
 	uint64_t video_seek_done_us = sceKernelGetProcessTimeWide();
 	if (ret >= 0 && player->has_audio) {
-		if (position_ms == 0) {
-			/* An indexed hop to absolute zero can report success while an
-			 * independent audio cursor remains on its previous Matroska cluster.
-			 * A fresh cursor is deterministic and this exceptional path is only
-			 * used for an actual restart from the beginning. */
-			input_close(&player->audio_input);
-			ret = player->cancel && *player->cancel ? AVERROR_EXIT
-			      : input_open(&player->audio_input, &player->config.stream,
-			                   player->cancel, "audio-zero-reopen", 0);
-			if (ret >= 0 &&
-			    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-			     !playable_aac_stream(
-			         player->audio_input.format->streams[audio_index])))
-				ret = AVERROR_DECODER_NOT_FOUND;
-			if (ret >= 0) {
-				isolate_input_stream(player->audio_input.format, audio_index);
-				log_printf("decoder audio zero: reopened cursor selected=%d ret=0\n",
-				           audio_index);
-			}
-		} else {
+		ret = reopen_audio_input(player, NULL, "audio-seek-reopen");
+		if (ret >= 0 &&
+		    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
+		     !playable_aac_stream(
+		         player->audio_input.format->streams[audio_index])))
+			ret = AVERROR_DECODER_NOT_FOUND;
+		if (ret >= 0 && position_ms > 0)
 			ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
-		}
+		else if (ret >= 0)
+			isolate_input_stream(player->audio_input.format, audio_index);
 	}
 	uint64_t demux_done_us = sceKernelGetProcessTimeWide();
 	if (ret < 0) {
@@ -1190,6 +1190,17 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		log_printf("decoder seek: stage=first-frame ready=0 ret=%d cause=timeout\n",
 		           AVERROR(ETIMEDOUT));
 		return AVERROR(ETIMEDOUT);
+	}
+	if (player->has_audio && player->audio.eof &&
+	    !player->audio.first_packet_ready &&
+	    !audio_eof_expected_at(player, audio_index, position_ms)) {
+		uint64_t audio_end_ms = stream_logical_end_ms(
+		    player->audio_input.format, audio_index);
+		log_printf("decoder seek: audio EOF before expected end target=%llu ms audio-end=%llu ms duration=%llu ms; reopening\n",
+		           (unsigned long long)position_ms,
+		           (unsigned long long)audio_end_ms,
+		           (unsigned long long)player->duration_ms);
+		return AVERROR_INVALIDDATA;
 	}
 	if (player->has_audio && !player->audio.first_packet_ready &&
 	    !player->audio.eof) {
@@ -1429,6 +1440,18 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		           ret);
 		goto fail;
 	}
+	if (player->has_audio && player->audio.eof &&
+	    !player->audio.first_packet_ready &&
+	    !audio_eof_expected_at(player, audio_index, start_position_ms)) {
+		uint64_t audio_end_ms = stream_logical_end_ms(
+		    player->audio_input.format, audio_index);
+		ret = AVERROR_INVALIDDATA;
+		log_printf("decoder startup: audio EOF before expected end target=%llu ms audio-end=%llu ms duration=%llu ms ret=%d\n",
+		           (unsigned long long)start_position_ms,
+		           (unsigned long long)audio_end_ms,
+		           (unsigned long long)player->duration_ms, ret);
+		goto fail;
+	}
 	if (player->has_audio && !player->audio.first_packet_ready &&
 	    !player->audio.eof) {
 		ret = player->audio.had_error ? AVERROR_INVALIDDATA
@@ -1498,7 +1521,7 @@ int vita_sw_decoder_open(VitaSwDecoderPlayer *player,
 	if (player->config.audio_track < 0) player->config.audio_track = 0;
 	if (player->config.volume_percent < 0) player->config.volume_percent = 0;
 	if (player->config.volume_percent > 300) player->config.volume_percent = 300;
-	player->paused = 0;
+	player->paused = config->start_paused != 0;
 	/* A newly opening session has never published a texture. Failure cleanup is
 	 * therefore already GPU-safe and must not call vita2d from this worker. */
 	player->video_gpu_fenced = 1;
@@ -1655,6 +1678,9 @@ int vita_sw_decoder_select_audio_track_with_cancel(
 		return VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK;
 	}
 	int previous_track = player->config.audio_track;
+	log_printf("decoder audio transaction: begin prior=%d requested=%d target=%llu ms\n",
+	           previous_track, audio_track,
+	           (unsigned long long)position_ms);
 	if (!audio_operation_begin(player)) return AVERROR(EBUSY);
 	player->config.audio_track = audio_track;
 	int ret = restart_audio_track(player, audio_track, position_ms,
@@ -1671,7 +1697,7 @@ int vita_sw_decoder_select_audio_track_with_cancel(
 	}
 	audio_operation_begin_rollback(player);
 	int restore_ret = restart_audio_track(player, previous_track, position_ms,
-	                                      &player->audio_operation_interrupted, 0);
+	                                      &player->audio_operation_interrupted, 1);
 	if (restore_ret >= 0) {
 		if (audio_operation_commit(
 		        player, &player->audio_operation_interrupted)) {
@@ -1763,7 +1789,14 @@ static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
 		return player->clock_us;
 	}
 	uint64_t raw = vita_sw_elementary_audio_clock_us(&player->audio);
-	if (!raw) return 0;
+	if (!raw) {
+		/* A newly opened AudioOut port has not completed its first blocking grain
+		 * yet. Keep the verified seek/switch target instead of collapsing the public
+		 * clock to zero and presenting stale beginning-of-file video/subtitles. */
+		player->clock_started = 1;
+		player->clock_wall_us = now;
+		return player->clock_us;
+	}
 	if (!player->clock_started) {
 		player->clock_started = 1;
 		player->clock_us = raw;
@@ -1786,6 +1819,7 @@ int vita_sw_decoder_present(VitaSwDecoderPlayer *player, int fill_screen) {
 	uint64_t clock = presentation_clock(player);
 	uint64_t raw = audio_is_clock_master(player)
 	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
+	if (!raw) raw = clock;
 	return vita_sw_software_video_present(&player->video, clock, raw,
 	                              fill_screen, !player->paused);
 }
@@ -1797,6 +1831,7 @@ int vita_sw_decoder_present_rect(VitaSwDecoderPlayer *player,
 	uint64_t clock = presentation_clock(player);
 	uint64_t raw = audio_is_clock_master(player)
 	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
+	if (!raw) raw = clock;
 	return vita_sw_software_video_present_rect(&player->video,
 	                                   clock, raw,
 	                                   x, y, width, height, fill_rect,
@@ -1820,11 +1855,8 @@ void vita_sw_decoder_get_status(VitaSwDecoderPlayer *player,
 	if (!player) return;
 	SoftwareVideoDebugSnapshot debug;
 	vita_sw_software_video_debug_snapshot(&player->video, &debug);
-	int audio_master = audio_is_clock_master(player);
-	uint64_t status_clock_us = audio_master
-	                         ? vita_sw_elementary_audio_clock_us(&player->audio)
-	                         : (player->opened ? presentation_clock(player)
-	                                           : player->clock_us);
+	uint64_t status_clock_us = player->opened
+	                         ? presentation_clock(player) : player->clock_us;
 	status->opened = player->opened;
 	status->paused = player->paused;
 	status->eof = player->video.eof && debug.ready_frames == 0 &&
