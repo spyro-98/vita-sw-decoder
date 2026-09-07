@@ -26,6 +26,37 @@ VitaSwDecoderPlayerConfig config = {0};
 
 ## Integrate in three steps
 
+### Experimental live input (`feature/iptv`)
+
+`vita_sw_decoder_live.h` adds a separate opt-in `open_live()` entry point.
+The existing 2.x header, public struct layouts and `open()` file-playback
+behavior are unchanged. Live transport is supplied by the application, not
+implemented inside the decoder:
+
+```c
+#include <vita_sw_decoder_live.h>
+VitaSwDecoderLiveOptions live = { .size = sizeof(live), .version = 1 };
+/* config.stream opens two identical start cursors, with size=-1, NULL seek,
+ * cooperative blocking reads and a prompt, non-owning abort callback. */
+int result = vita_sw_decoder_open_live(player, &config, &live);
+```
+
+V1 accepts multiplexed MPEG-TS with H.264 and mono/stereo AAC, at most 1280x720.
+Use zero start position/audio ordinal. Temporary starvation must block
+cooperatively rather than return EOF; the transport must bound waiting and
+memory. Both cursors must begin at the same retained segment. Non-seekable
+AVIO skips tail/duration scans; both demuxers use the video demux's PTS origin.
+Seek/track changes return ENOSYS without tearing down live playback. The app
+must close both pipelines and reconnect on discontinuity, lag or resume-live.
+Codec internals and existing file seek/track-switch recovery remain intact.
+
+VitaMediaDeck host tests validated forward-only demux/decode with the pinned
+FFmpeg 6.0 base at a nonzero PTS origin. Native `-O3` compilation passes.
+Actual Vita live A/V synchronization, audio output and long-session stability
+still require hardware testing; this API is experimental, not broadcast-certified.
+
+### Finite files (unchanged)
+
 ```sh
 export VITASDK=/path/to/vitasdk
 ./tools/build-ffmpeg.sh

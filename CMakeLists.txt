@@ -68,7 +68,8 @@ endif()
 
 install(TARGETS vita_sw_decoder EXPORT VitaSwDecoderTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(FILES include/vita_sw_decoder.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/vita_sw_decoder.h include/vita_sw_decoder_live.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES
   "${VITA_SW_DECODER_FFMPEG_ROOT}/lib/libavformat.a"
   "${VITA_SW_DECODER_FFMPEG_ROOT}/lib/libavcodec.a"
