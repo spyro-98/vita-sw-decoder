@@ -57,6 +57,15 @@ target_compile_features(vita_sw_decoder PUBLIC c_std_11)
 target_compile_definitions(vita_sw_decoder PRIVATE
   VITA_SW_DECODER_HAS_H264_VITA=0
   VITA_SW_DECODER_ALLOW_SOFTWARE_FALLBACK=1)
+set(VITA_SW_DECODER_CPU_THREADS "3" CACHE STRING "Experimental seekable H.264 CPU workers (1..3)")
+if(NOT VITA_SW_DECODER_CPU_THREADS MATCHES "^[123]$")
+  message(FATAL_ERROR "VITA_SW_DECODER_CPU_THREADS must be 1, 2 or 3")
+endif()
+target_compile_definitions(vita_sw_decoder PRIVATE SOFTWARE_VIDEO_DECODER_THREADS=${VITA_SW_DECODER_CPU_THREADS})
+option(VITA_SW_DECODER_PLANAR_UPLOAD "Experimental copied YUV420P3 GXM upload" OFF)
+if(VITA_SW_DECODER_PLANAR_UPLOAD)
+  target_compile_definitions(vita_sw_decoder PRIVATE SOFTWARE_VIDEO_PLANAR_COPY_ENABLED=1)
+endif()
 target_compile_options(vita_sw_decoder PRIVATE
   -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard
   -O3 -ffunction-sections -fdata-sections)

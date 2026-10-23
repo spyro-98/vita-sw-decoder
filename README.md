@@ -46,6 +46,13 @@ Use zero start position/audio ordinal. Temporary starvation must block
 cooperatively rather than return EOF; the transport must bound waiting and
 memory. Both cursors must begin at the same retained segment. Non-seekable
 AVIO skips tail/duration scans; both demuxers use the video demux's PTS origin.
+The live video presentation conversion now subtracts this shared origin before
+frame reordering, matching AAC clock normalization. This fixes the startup
+rejection seen with a 10.0101-second HLS origin; the ordinary file entry point
+continues to pass a zero video offset and its seek/track contracts are unchanged.
+Finite HLS VOD can use the same forward-only adapter; the app decides whether
+pause resumes in place or reconnects live. Duration/playlist windows stay above
+the decoder. Native builds and host timestamp tests are not Vita playback proof.
 Seek/track changes return ENOSYS without tearing down live playback. The app
 must close both pipelines and reconnect on discontinuity, lag or resume-live.
 Codec internals and existing file seek/track-switch recovery remain intact.
@@ -54,6 +61,15 @@ VitaMediaDeck host tests validated forward-only demux/decode with the pinned
 FFmpeg 6.0 base at a nonzero PTS origin. Native `-O3` compilation passes.
 Actual Vita live A/V synchronization, audio output and long-session stability
 still require hardware testing; this API is experimental, not broadcast-certified.
+
+The live options also accept `version = 2` for application-remuxed single-program
+MPEG-TS. The options remain 16 bytes: the two V1 reserved words are exposed as
+`audio.sample_rate` (decoded PCM rate, 8000–48000) and `audio.channels` (1–2)
+only in V2. This preserves HE-AAC/SBR output metadata that an ADTS-only probe
+may report at the core AAC rate. V1 callers must still leave both words zero.
+Only V2 limits optional stream/FPS probing to avoid a low-bitrate startup stall;
+V1 HLS and ordinary file-probe settings remain unchanged. No file API/ABI,
+seek or track-switch contract is changed by this extension.
 
 ### Finite files (unchanged)
 

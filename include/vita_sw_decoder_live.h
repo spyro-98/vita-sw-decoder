@@ -12,8 +12,11 @@
  * Seeking and audio track changes return ENOSYS without mutating playback. */
 typedef struct VitaSwDecoderLiveOptions {
     uint32_t size;
-    uint32_t version; /* 1 */
-    uint32_t reserved[2]; /* must be zero */
+    uint32_t version; /* 1: original contract; 2: explicit decoded AAC shape */
+    union {
+        uint32_t reserved[2]; /* V1 must be zero; layout remains 16 bytes. */
+        struct { uint32_t sample_rate, channels; } audio; /* V2 only */
+    };
 } VitaSwDecoderLiveOptions;
 
 int vita_sw_decoder_open_live(VitaSwDecoderPlayer *player,

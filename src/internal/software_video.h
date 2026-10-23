@@ -24,6 +24,7 @@ typedef struct SoftwareVideoZeroSurface {
 	SceUID memblock;
 	uint32_t allocation_size;
 	volatile int in_use;
+ SceUID release_event;
 } SoftwareVideoZeroSurface;
 
 typedef struct {
@@ -48,9 +49,11 @@ typedef struct {
 	AVFormatContext *demux;          /* owned by the caller */
 	int stream_index;
 	AVCodecContext *decoder;
+ int decoder_thread_count,decoder_active_thread_type;
 	volatile int *cancel;
 	volatile int *start_gate;
 	AVRational time_base;
+	int64_t timeline_origin_us; /* Nonzero only for the opt-in live/VOD HLS path. */
 
 	uint32_t content_width;
 	uint32_t content_height;
@@ -72,6 +75,7 @@ typedef struct {
 	SoftwareVideoFrameSlot slots[SOFTWARE_VIDEO_FRAME_SLOTS];
 	SoftwareVideoZeroSurface zero_surfaces[SOFTWARE_VIDEO_ZERO_COPY_SURFACES];
 	volatile int slot_lock;
+ SceUID frame_event;
 	int display_slot;
 	int retire_slot;
 	uint32_t next_serial;
@@ -104,6 +108,7 @@ typedef struct {
 	uint32_t presentation_gap_max_us;
 	unsigned int presentation_cadence_breaks;
 	uint64_t decode_time_us;
+ uint64_t decode_work_time_us;
 	uint64_t copy_time_us;
 	uint64_t queue_wait_time_us;
 	volatile uint32_t zero_surface_wait_us;
@@ -147,7 +152,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	                     uint32_t expected_height, int expected_fps,
 	                     uint64_t initial_position_ms,
 	                     volatile int *cancel,
-	                     volatile int *start_gate);
+	                     volatile int *start_gate, int64_t timeline_origin_us);
 
 void vita_sw_software_video_join(SoftwareVideoState *st);
 

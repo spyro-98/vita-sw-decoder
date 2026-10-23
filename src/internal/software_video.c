@@ -28,9 +28,18 @@
 
 #define SOFTWARE_VIDEO_THREAD_STACK    0x100000
 #define SOFTWARE_VIDEO_WORKER_STACK    0x20000
+#ifndef SOFTWARE_VIDEO_DECODER_THREADS
 #define SOFTWARE_VIDEO_DECODER_THREADS 3
+#endif
 #define SOFTWARE_VIDEO_THREAD_PRIORITY 65
+/* Experimental copied P3 upload. Keeps the ordinary FFmpeg allocator and
+ * independent presentation ring; it does NOT revive CPU zero-copy. */
+#ifndef SOFTWARE_VIDEO_PLANAR_COPY_ENABLED
+#define SOFTWARE_VIDEO_PLANAR_COPY_ENABLED 0
+#endif
 #define SOFTWARE_VIDEO_POLL_US         1000
+#define SOFTWARE_VIDEO_WAIT_US         16000
+#define SOFTWARE_VIDEO_WAKE_BIT        1u
 #define SOFTWARE_VIDEO_HIGHFPS_LATE_US 50000ULL
 #define SOFTWARE_VIDEO_HIGHFPS_RECOVER_US 18000ULL
 #define SOFTWARE_VIDEO_HIGHFPS_CATCHUP_US 65000ULL
@@ -85,8 +94,33 @@ static void slots_unlock(SoftwareVideoState *st) {
 	__sync_lock_release(&st->slot_lock);
 }
 
+/* One decoder worker waits on this kernel event; UI/GPU completion and AVBuffer
+ * release signal it from arbitrary threads. Clear before testing the predicate,
+ * never between testing and waiting: a release in that interval must be retained.
+ * The bounded timeout observes external cancellation even without a signal. */
+static void video_notify(SoftwareVideoState *st) {
+ if(st && st->frame_event>=0)sceKernelSetEventFlag(st->frame_event,SOFTWARE_VIDEO_WAKE_BIT);
+}
+static void video_wait_prepare(SoftwareVideoState *st) {
+ if(st->frame_event>=0)sceKernelClearEventFlag(st->frame_event,~SOFTWARE_VIDEO_WAKE_BIT);
+}
+static uint32_t video_wait(SoftwareVideoState *st) {
+ uint64_t before=sceKernelGetProcessTimeWide();
+ if(st->frame_event>=0){
+  SceUInt timeout=SOFTWARE_VIDEO_WAIT_US;unsigned matched=0;
+  int ret=sceKernelWaitEventFlag(st->frame_event,SOFTWARE_VIDEO_WAKE_BIT,
+       SCE_EVENT_WAITOR|SCE_EVENT_WAITCLEAR_PAT,&matched,&timeout);
+  /* A broken/missing event must degrade to polling, never busy-spin. */
+  if(ret<0 && sceKernelGetProcessTimeWide()-before<SOFTWARE_VIDEO_POLL_US)
+   sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
+ }else sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
+ uint64_t elapsed=sceKernelGetProcessTimeWide()-before;
+ return elapsed>UINT32_MAX?UINT32_MAX:(uint32_t)elapsed;
+}
+static int allocate_copy_ring(SoftwareVideoState *st);
+
 static int should_stop(const SoftwareVideoState *st) {
-	return st->stop || (st->cancel && *st->cancel);
+	return __atomic_load_n(&st->stop,__ATOMIC_ACQUIRE) || (st->cancel && __atomic_load_n(st->cancel,__ATOMIC_ACQUIRE));
 }
 
 static int first_video_stream(const AVFormatContext *ctx) {
@@ -144,7 +178,8 @@ static void zero_surface_release(void *opaque, uint8_t *data) {
 	(void)data;
 	SoftwareVideoZeroSurface *surface = (SoftwareVideoZeroSurface *)opaque;
 	__sync_synchronize();
-	surface->in_use = 0;
+	__sync_lock_release(&surface->in_use);
+ if(surface->release_event>=0)sceKernelSetEventFlag(surface->release_event,SOFTWARE_VIDEO_WAKE_BIT);
 }
 
 /* Each AVBufferRef owns one complete contiguous YUV surface. The callback is
@@ -170,6 +205,7 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 
 	SoftwareVideoZeroSurface *surface = NULL;
 	for (;;) {
+        video_wait_prepare(st);
 		if (should_stop(st)) return AVERROR_EXIT;
 		for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++) {
 			if (__sync_bool_compare_and_swap(&st->zero_surfaces[i].in_use, 0, 1)) {
@@ -178,9 +214,8 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 			}
 		}
 		if (surface) break;
-		sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
-		__sync_fetch_and_add(&st->zero_surface_wait_us,
-		                     SOFTWARE_VIDEO_POLL_US);
+        uint32_t waited=video_wait(st);
+		__sync_fetch_and_add(&st->zero_surface_wait_us,waited);
 	}
 
 	AVBufferRef *owner = av_buffer_create((uint8_t *)surface->pixels,
@@ -204,12 +239,14 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 	return 0;
 }
 
+#include "video_timeline.h"
 static uint64_t scale_frame_timestamp_us(const SoftwareVideoState *st,
 	                                     int64_t pts) {
 	if (pts == AV_NOPTS_VALUE) return 0;
 	int64_t scaled = av_rescale_q(pts, st->time_base,
 	                              (AVRational){ 1, 1000000 });
-	return scaled < 0 ? 0 : (uint64_t)scaled;
+	/* Normalize before reordering/repair, using exactly the audio origin. */
+	return video_timeline_us(scaled, st->timeline_origin_us);
 }
 
 static uint64_t frame_pts_us(SoftwareVideoState *st, const AVFrame *frame) {
@@ -294,19 +331,19 @@ static uint64_t frame_pts_us(SoftwareVideoState *st, const AVFrame *frame) {
 static int reserve_slot(SoftwareVideoState *st) {
 	uint64_t wait_started = sceKernelGetProcessTimeWide();
 	for (;;) {
+        video_wait_prepare(st);
 		if (should_stop(st)) return -1;
 		slots_lock(st);
 		for (int i = 0; i < st->queue_capacity; i++) {
 			if (st->slots[i].state == SLOT_FREE) {
 				st->slots[i].state = SLOT_WRITING;
-				slots_unlock(st);
-				st->queue_wait_time_us +=
-				    sceKernelGetProcessTimeWide() - wait_started;
+				st->queue_wait_time_us += sceKernelGetProcessTimeWide()-wait_started;
+                slots_unlock(st);
 				return i;
 			}
 		}
 		slots_unlock(st);
-		sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
+		video_wait(st);
 	}
 }
 
@@ -328,42 +365,46 @@ static int copy_yuv420_frame(SoftwareVideoState *st, int slot_index,
 	}
 
 	uint8_t *base = (uint8_t *)st->slots[slot_index].pixels;
+    if(!base || !frame->data[0] || !frame->data[1] || !frame->data[2])return AVERROR(EINVAL);
 	uint8_t *dst_y = base;
 	uint8_t *dst_uv = base + st->pitch * st->texture_height;
-	int exact_width = (uint32_t)frame->width == st->pitch;
-	/* 1280x720 is the hot path. Clearing the complete 1280x768 allocation
-	 * before immediately overwriting 720 rows cost almost one extra megabyte
-	 * of CPU writes per picture. Clear only the hidden aligned tail when no
-	 * horizontal padding exists; smaller formats retain the simple full clear
-	 * that also initializes their right-hand padding. */
-	if (exact_width) {
-		if (frame->linesize[0] == frame->width) {
-			memcpy(dst_y, frame->data[0],
-			       (size_t)frame->width * (size_t)frame->height);
-		} else {
-			for (int y = 0; y < frame->height; y++)
-				memcpy(dst_y + (uint32_t)y * st->pitch,
-				       frame->data[0] + y * frame->linesize[0], frame->width);
-		}
-		if ((uint32_t)frame->height < st->texture_height)
-			memset(dst_y + (uint32_t)frame->height * st->pitch, 16,
-			       st->pitch * (st->texture_height - (uint32_t)frame->height));
-	} else {
-		/* Black luma + neutral chroma also make the 360->368 padding harmless. */
-		memset(dst_y, 16, st->pitch * st->texture_height);
-		for (int y = 0; y < frame->height; y++)
-			memcpy(dst_y + (uint32_t)y * st->pitch,
-			       frame->data[0] + y * frame->linesize[0], frame->width);
-	}
+    int chroma_w=(frame->width+1)/2;
+    /* Accept negative strides, but reject an undersized plane before reading it. */
+    int64_t sy=frame->linesize[0],su=frame->linesize[1],sv=frame->linesize[2];
+    if((sy<0?-sy:sy)<frame->width || (su<0?-su:su)<chroma_w || (sv<0?-sv:sv)<chroma_w)
+        return AVERROR(EINVAL);
+    if(frame->linesize[0]==frame->width && (uint32_t)frame->width==st->pitch)
+        memcpy(dst_y,frame->data[0],(size_t)frame->width*frame->height);
+    else for(int y=0;y<frame->height;y++){
+        uint8_t *out=dst_y+(uint32_t)y*st->pitch;
+        memcpy(out,frame->data[0]+(ptrdiff_t)y*frame->linesize[0],frame->width);
+        if((uint32_t)frame->width<st->pitch)memset(out+frame->width,16,st->pitch-frame->width);
+    }
+    if((uint32_t)frame->height<st->texture_height) {
+        memset(dst_y+(uint32_t)frame->height*st->pitch,16,
+               st->pitch*(st->texture_height-(uint32_t)frame->height));
+    }
+
+#if SOFTWARE_VIDEO_PLANAR_COPY_ENABLED
+    uint32_t cp=st->pitch/2,ch=st->texture_height/2;
+    for(int plane=1;plane<=2;plane++){
+        uint8_t *dst=dst_uv+(plane-1)*cp*ch;
+        int rows=(frame->height+1)/2,columns=(frame->width+1)/2;
+        for(int y=0;y<rows;y++){
+            memcpy(dst+(uint32_t)y*cp,frame->data[plane]+(ptrdiff_t)y*frame->linesize[plane],columns);
+            if((uint32_t)columns<cp)memset(dst+(uint32_t)y*cp+columns,128,cp-columns);
+        }
+        if((uint32_t)rows<ch)memset(dst+(uint32_t)rows*cp,128,cp*(ch-rows));
+    }
+    return 0;
+#else
 
 	int chroma_width = (frame->width + 1) / 2;
 	int chroma_height = (frame->height + 1) / 2;
-	if (!exact_width)
-		memset(dst_uv, 128, st->pitch * (st->texture_height / 2));
 	for (int y = 0; y < chroma_height; y++) {
 		uint8_t *out = dst_uv + (uint32_t)y * st->pitch;
-		const uint8_t *src_u = frame->data[1] + y * frame->linesize[1];
-		const uint8_t *src_v = frame->data[2] + y * frame->linesize[2];
+		const uint8_t *src_u = frame->data[1] + (ptrdiff_t)y * frame->linesize[1];
+		const uint8_t *src_v = frame->data[2] + (ptrdiff_t)y * frame->linesize[2];
 		int x = 0;
 		/* Cortex-A9 NEON writes sixteen U/V pairs per instruction group instead
 		 * of the scalar byte-at-a-time loop that dominated 720p copy time. */
@@ -380,11 +421,14 @@ static int copy_yuv420_frame(SoftwareVideoState *st, int slot_index,
 			out[x * 2] = src_u[x];
 			out[x * 2 + 1] = src_v[x];
 		}
+        if((uint32_t)chroma_width*2<st->pitch)
+            memset(out+chroma_width*2,128,st->pitch-chroma_width*2);
 	}
-	if (exact_width && (uint32_t)chroma_height < st->texture_height / 2)
+	if ((uint32_t)chroma_height < st->texture_height / 2)
 		memset(dst_uv + (uint32_t)chroma_height * st->pitch, 128,
 		       st->pitch * (st->texture_height / 2 - (uint32_t)chroma_height));
 	return 0;
+#endif
 }
 
 static int publish_frame(SoftwareVideoState *st, const AVFrame *frame) {
@@ -500,7 +544,8 @@ static int publish_frame(SoftwareVideoState *st, const AVFrame *frame) {
 	} else {
 		uint64_t copy_started = sceKernelGetProcessTimeWide();
 		publish_ret = copy_yuv420_frame(st, slot_index, frame);
-		st->copy_time_us += sceKernelGetProcessTimeWide() - copy_started;
+        uint64_t copied=sceKernelGetProcessTimeWide()-copy_started;
+        slots_lock(st);st->copy_time_us+=copied;slots_unlock(st);
 	}
 	if (publish_ret < 0) {
 		slots_lock(st);
@@ -577,6 +622,11 @@ static int open_h264_decoder(SoftwareVideoState *st, AVStream *stream,
 		avcodec_free_context(&decoder);
 		return ret;
 	}
+    if(!hardware || !st->hardware_direct_available){
+        ret=allocate_copy_ring(st);
+        if(ret<0){avcodec_free_context(&decoder);return ret;}
+    }
+
 	/* h264_vita converts packet timestamps through pkt_timebase. Leaving it at
 	 * 0/1 made the codec assume that container ticks were already Vita ticks;
 	 * it is especially visible at the denser 60 fps cadence. */
@@ -611,8 +661,14 @@ static int open_h264_decoder(SoftwareVideoState *st, AVStream *stream,
 		 * it must never revive the old frame-threaded zero-copy experiment. */
 		st->zero_copy = 0;
 		st->queue_capacity = SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
-		decoder->thread_count = SOFTWARE_VIDEO_DECODER_THREADS;
-		decoder->thread_type = FF_THREAD_FRAME;
+		/* The September 7 Vita dump faults in pte_osThreadCreate while
+		 * init_thread starts FFmpeg frame workers for IPTV fallback. Keep
+		 * forward-only streams on this already asynchronous decode worker;
+		 * seekable files retain the established frame-threaded policy. */
+		int forward_only = st->demux && st->demux->pb &&
+		                   !st->demux->pb->seekable;
+		decoder->thread_count = forward_only ? 1 : SOFTWARE_VIDEO_DECODER_THREADS;
+		decoder->thread_type = forward_only ? 0 : FF_THREAD_FRAME;
 		decoder->flags2 |= AV_CODEC_FLAG2_FAST;
 		if (st->continuous_high_fps) {
 			decoder->skip_frame = AVDISCARD_DEFAULT;
@@ -630,6 +686,8 @@ static int open_h264_decoder(SoftwareVideoState *st, AVStream *stream,
 		avcodec_free_context(&decoder);
 		return ret;
 	}
+	st->decoder_thread_count=decoder->thread_count;
+    st->decoder_active_thread_type=decoder->active_thread_type;
 	st->decoder = decoder;
 	st->hardware_accelerated = hardware;
 	return 0;
@@ -756,7 +814,7 @@ static void *vita_sw_software_video_thread(void *argp) {
 			break;
 		}
 
-		st->packets_read++;
+        slots_lock(st);st->packets_read++;slots_unlock(st);
 		if (st->hardware_accelerated && st->frames_decoded == 0 &&
 		    startup_replay_available) {
 			if (startup_packet_count < SOFTWARE_VIDEO_STARTUP_REPLAY_PACKETS) {
@@ -769,6 +827,8 @@ static void *vita_sw_software_video_thread(void *argp) {
 				startup_replay_available = 0;
 			}
 		}
+        uint64_t queue_before=st->queue_wait_time_us,copy_before=st->copy_time_us;
+        uint32_t surface_before=st->zero_surface_wait_us;
 		uint64_t t0 = sceKernelGetProcessTimeWide();
 		int ret = decode_packet(st, packet, frame);
 		if (ret < 0 && startup_replay_available)
@@ -786,7 +846,12 @@ static void *vita_sw_software_video_thread(void *argp) {
 			}
 			break;
 		}
-		st->decode_time_us += sceKernelGetProcessTimeWide() - t0;
+        uint64_t elapsed=sceKernelGetProcessTimeWide()-t0;
+        uint64_t blocked=st->queue_wait_time_us-queue_before+st->copy_time_us-copy_before+
+            (uint32_t)(st->zero_surface_wait_us-surface_before);
+        slots_lock(st);st->decode_time_us+=elapsed;
+        st->decode_work_time_us+=elapsed>blocked?elapsed-blocked:0;
+        slots_unlock(st);
 	}
 
 
@@ -795,10 +860,11 @@ done:
 	av_packet_free(&packet);
 	av_frame_free(&frame);
 	avcodec_free_context(&st->decoder);
-	log_printf("software video: thread end pkt=%u frame=%u decode=%llu ms copy=%llu ms queue_wait=%llu ms surface_wait=%u ms late_drop=%u catchup_switch=%u pts_fix=%u missing=%u nonmono=%u zero=%d eof=%d err=%d",
+	log_printf("software video: thread end pkt=%u frame=%u decode=%llu ms copy=%llu ms work=%llu ms queue_wait=%llu ms surface_wait=%u ms late_drop=%u catchup_switch=%u pts_fix=%u missing=%u nonmono=%u zero=%d eof=%d err=%d",
 	           st->packets_read, st->frames_decoded,
 	           (unsigned long long)(st->decode_time_us / 1000ULL),
 	           (unsigned long long)(st->copy_time_us / 1000ULL),
+               (unsigned long long)(st->decode_work_time_us / 1000ULL),
 	           (unsigned long long)(st->queue_wait_time_us / 1000ULL),
 	           st->zero_surface_wait_us / 1000u, st->frames_late_dropped,
 	           st->catchup_switches, st->hardware_pts_repairs,
@@ -820,10 +886,12 @@ static void release_frame_buffers(SoftwareVideoState *st) {
 	}
 	for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++)
 		free_zero_surface(&st->zero_surfaces[i]);
+    if(st->frame_event>=0){sceKernelDeleteEventFlag(st->frame_event);st->frame_event=-1;}
 }
 
 static int allocate_copy_ring(SoftwareVideoState *st) {
 	for (int i = 0; i < SOFTWARE_VIDEO_COPY_FRAME_SLOTS; i++) {
+        if(st->slots[i].pixels)continue;
 		char name[32];
 		snprintf(name, sizeof(name), "VitaSwDecoderSwFrame%d", i);
 		st->slots[i].allocation_size = ALIGN_UP_U32(st->frame_bytes,
@@ -832,6 +900,8 @@ static int allocate_copy_ring(SoftwareVideoState *st) {
 		                                           &st->slots[i].memblock);
 		if (!st->slots[i].pixels) return AVERROR(ENOMEM);
 	}
+    st->ring_memory_bytes=st->slots[0].allocation_size*SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
+    if(st->hardware_direct_available)st->ring_memory_bytes+=st->zero_surfaces[0].allocation_size*SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
 	return 0;
 }
 
@@ -865,9 +935,10 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	                     uint32_t expected_height, int expected_fps,
 	                     uint64_t initial_position_ms,
 	                     volatile int *cancel,
-	                     volatile int *start_gate) {
+	                     volatile int *start_gate, int64_t timeline_origin_us) {
 	if (!st || !demux || !cancel) return AVERROR(EINVAL);
 	memset(st, 0, sizeof(*st));
+    st->frame_event=-1;
 	st->demux = demux;
 	st->cancel = cancel;
 	st->start_gate = start_gate;
@@ -891,6 +962,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	}
 	st->stream_index = stream_index;
 	st->time_base = stream->time_base;
+	st->timeline_origin_us = timeline_origin_us;
 	uint32_t width = stream->codecpar->width > 0
 	               ? (uint32_t)stream->codecpar->width : expected_width;
 	uint32_t height = stream->codecpar->height > 0
@@ -927,33 +999,35 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	/* wiliwili's public h264_vita direct path requests VITA_NV12, whose decoder
 	 * pitch is 16-byte aligned. Match it exactly for cropped widths such as 854;
 	 * it is also sufficient for the NEON copy fallback. */
-	st->texture_width = ALIGN_UP_U32(width, 16);
+	st->texture_width = ALIGN_UP_U32(width, SOFTWARE_VIDEO_PLANAR_COPY_ENABLED?32:16);
 	/* h264_vita's public direct-render contract lays the UV plane after the
 	 * 16-row-aligned decoded height. Keep the GXM texture on that exact layout;
 	 * the CPU copy fallback writes only visible rows and does not need to mirror
 	 * libavcodec's private SIMD allocation envelope. */
 	st->texture_height = ALIGN_UP_U32(height, 16);
+#if VITA_SW_DECODER_HAS_H264_VITA
+    /* The upstream hardware contract uses at least 64 decoded rows/columns.
+     * A smaller NV12 height places UV over the hardware luma output. */
+    if(st->hardware_runtime_ready){
+        if(st->texture_width<64)st->texture_width=64;
+        if(st->texture_height<64)st->texture_height=64;
+    }
+#endif
 	st->pitch = st->texture_width;
 	st->frame_bytes = st->pitch * st->texture_height * 3 / 2;
 
-	/* Keep the copied ring allocated even when hardware direct rendering is
-	 * available. It is the immediate, in-process landing zone if h264_vita
-	 * rejects the first SPS/AU and the startup packets are replayed on CPU. */
-	int buffer_ret = allocate_copy_ring(st);
-	if (buffer_ret < 0) {
-		log_printf("software video: P2 ring allocation failed -> %d",
-		           buffer_ret);
-		release_frame_buffers(st);
-		return buffer_ret;
-	}
-	st->ring_memory_bytes = st->slots[0].allocation_size *
-	                       SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
+    int buffer_ret=0;
+    (void)buffer_ret;
+    st->frame_event=sceKernelCreateEventFlag("VideoFrameReady",0,0,NULL);
+    for(int i=0;i<SOFTWARE_VIDEO_ZERO_COPY_SURFACES;i++)
+        st->zero_surfaces[i].release_event=st->frame_event;
+
 #if VITA_SW_DECODER_HAS_H264_VITA
 	if (SOFTWARE_VIDEO_HARDWARE_DIRECT_ENABLED && st->hardware_runtime_ready) {
 		buffer_ret = allocate_zero_copy_pool(st);
 		if (buffer_ret >= 0) {
 			st->hardware_direct_available = 1;
-			st->ring_memory_bytes += st->zero_surfaces[0].allocation_size *
+			st->ring_memory_bytes = st->zero_surfaces[0].allocation_size *
 			                         SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
 		} else {
 			/* Partial pool allocations cannot be used, but the copied ring is
@@ -985,7 +1059,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	/* The setup API remains synchronous: audio must not be started until the
 	 * decoder has either opened successfully or reported its exact error. */
 	while (!st->init_done) {
-		if (*cancel) st->stop = 1;
+		if (*cancel) __atomic_store_n(&st->stop,1,__ATOMIC_RELEASE);
 		sceKernelDelayThread(SOFTWARE_VIDEO_POLL_US);
 	}
 	__sync_synchronize();
@@ -1008,9 +1082,10 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	           st->pitch,
 	           st->ring_memory_bytes / 1024u,
 	           st->queue_capacity,
-	           st->zero_copy ? "HW_DIRECT_NV12" : "COPY_YUV420P2",
-	           SOFTWARE_VIDEO_DECODER_THREADS,
-	           st->decoder ? st->decoder->active_thread_type : 0,
+	           st->zero_copy ? "HW_DIRECT_NV12" :
+               SOFTWARE_VIDEO_PLANAR_COPY_ENABLED ? "COPY_YUV420P3" : "COPY_YUV420P2",
+	           st->decoder_thread_count,
+	           st->decoder_active_thread_type,
 	           st->continuous_high_fps);
 	return 0;
 }
@@ -1190,7 +1265,7 @@ int vita_sw_software_video_present_rect(SoftwareVideoState *st,
 	int tex_ret = sceGxmTextureInitLinear(
 	    &st->texture.gxm_tex, texture_pixels,
 	    st->zero_copy ? SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1
-	                  : SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
+                      : SOFTWARE_VIDEO_PLANAR_COPY_ENABLED?SCE_GXM_TEXTURE_FORMAT_YUV420P3_CSC1:SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1,
 	    st->texture_width, st->texture_height, 0);
 	if (tex_ret < 0) {
 		log_printf("software video: sceGxmTextureInitLinear -> 0x%08X",
@@ -1246,6 +1321,7 @@ void vita_sw_software_video_discard_to_clock(SoftwareVideoState *st,
 		}
 	}
 	slots_unlock(st);
+    video_notify(st);
 }
 
 void vita_sw_software_video_buffer_status(SoftwareVideoState *st, int *ready_frames,
@@ -1307,19 +1383,22 @@ void vita_sw_software_video_debug_snapshot(SoftwareVideoState *st,
 
 void vita_sw_software_video_render_complete(SoftwareVideoState *st) {
 	if (!st) return;
+    int released=0;
 	slots_lock(st);
 	if (st->retire_slot >= 0) {
 		if (st->zero_copy && st->slots[st->retire_slot].frame)
 			av_frame_unref(st->slots[st->retire_slot].frame);
 		st->slots[st->retire_slot].state = SLOT_FREE;
-		st->retire_slot = -1;
+		st->retire_slot = -1;released=1;
 	}
 	slots_unlock(st);
+    if(released)video_notify(st);
 }
 
 void vita_sw_software_video_join(SoftwareVideoState *st) {
 	if (!st) return;
-	st->stop = 1;
+	__atomic_store_n(&st->stop,1,__ATOMIC_RELEASE);
+    video_notify(st);
 	if (st->started) {
 		int join_ret = pthread_join(st->thread, NULL);
 		if (join_ret != 0) {
