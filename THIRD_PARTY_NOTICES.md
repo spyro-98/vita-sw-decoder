@@ -11,3 +11,13 @@ the generated archive so a binary release can include corresponding source.
 
 - https://github.com/FFmpeg/FFmpeg
 - https://vitasdk.org/
+
+## VitaMediaDeck 1.4.1 integration
+
+The app links both decoder packages against the same patched FFmpeg n6.0
+archives. The SW standalone builder's FFmpeg 8.1.2 source/hash is a separate
+configuration. Distribute notices and corresponding source matching the actual
+linked archives; do not label the app binary FFmpeg 8.1.2 merely because the SW
+standalone dependency lock lists it. The documentation refresh changes no
+license, dependency pin or redistribution obligation. See
+[build and validation](docs/VALIDATION.md).

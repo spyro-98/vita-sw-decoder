@@ -10,6 +10,21 @@ the public Vita audio decoder. It never loads ReAvPlayer and never selects
 </p>
 <p align="center"><sub>FFmpeg software H.264 playback on PlayStation Vita</sub></p>
 
+## Current integration and documentation
+
+Package/API version remains **2.0.0**. The 23 October 2026 documentation refresh
+aligns this repository with **VitaMediaDeck 1.4.1 / APP_VER 01.05**; it changes
+no decoder source, public layout or dependency pin.
+
+- [Runtime and ownership contract](docs/RUNTIME.md)
+- [Performance options and measured limits](docs/PERFORMANCE.md)
+- [Build, validation and release guide](docs/VALIDATION.md)
+- [Change record](CHANGELOG.md)
+
+The app shares patched FFmpeg n6.0 across both backends.
+The standalone builder instead pins FFmpeg 8.1.2; do not confuse that prefix
+with the archive linked by the app.
+
 ## 2.0 ABI migration
 
 Version 2 adds `open_with_cancel` to `VitaSwDecoderStreamFactory` and the
@@ -71,7 +86,7 @@ Only V2 limits optional stream/FPS probing to avoid a low-bitrate startup stall;
 V1 HLS and ordinary file-probe settings remain unchanged. No file API/ABI,
 seek or track-switch contract is changed by this extension.
 
-### Finite files (unchanged)
+### Finite files (2.x contract)
 
 ```sh
 export VITASDK=/path/to/vitasdk
