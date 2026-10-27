@@ -35,9 +35,11 @@ under that load and Auto recovered hardware. Increasing only the timeout would
 not make sustained playback real-time. P3 throughput, quality and energy
 superiority are unproven. These are old test sessions, not new 1.4.1 measurements.
 
-The app's standard clock request remains 444/222/222/111 MHz when app control is
-selected. API readback must be measured; requested clocks are not evidence of
-actual clocks. PSVshell mode leaves control external. A physical comparison
+VitaMediaDeck now requests CPU 333 MHz for HW and 444 MHz for SW, with
+BUS/GPU/XBAR 222/222/111 MHz. The two CPU targets are independently configurable
+in the app; neither decoder package sets system clocks. API readback must be
+measured: a request is not proof of the actual clock. PSVshell manual hooks take
+priority, and explicit PSVshell mode writes no frequencies. A physical comparison
 requires the same file, intervals, backend, clocks, temperature, audio/subtitles
 and UI load, plus throughput, dropped pictures, lag, memory and battery data.
 
@@ -45,3 +47,10 @@ The detailed evidence is in VitaMediaDeck's
 [PlayerFix report](https://github.com/spyro-98/VitaMediaDeck/blob/feature/iptv/docs/console-validation-playerfix-2026-10-23.md).
 The paper/algorithm research is historical candidate work, not implemented speed
 or energy gains. See [validation](VALIDATION.md) for reproducible checks.
+
+## 27 October: scope of the integrated IPTV update
+
+The app's HLS timeline correction applies before backend selection. Its FFmpeg
+`h264_vita` lifecycle patch affects only hardware decoding; the successful IPTV
+console feedback is HW evidence. It does not supersede the SW 720p30/333 MHz
+limits above or demonstrate a new CPU decoder speedup.

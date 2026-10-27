@@ -22,6 +22,16 @@ no decoder source, public layout or dependency pin.
 - [Change record](CHANGELOG.md)
 
 The app shares patched FFmpeg n6.0 across both backends.
+
+The 27 October 2026 VitaMediaDeck IPTV update corrects app-side HLS timestamps
+for both video backends and patches the shared FFmpeg prefix's **hardware**
+`h264_vita` lifecycle. This software package still selects only CPU H.264; the
+hardware patch does not change its decoder algorithm or establish a SW speed
+improvement. The user's successful IPTV retest, including sources described as
+1080p, used **HW**. It is not new SW throughput evidence. This documentation
+update changes no package code, ABI or standalone FFmpeg dependency. See the
+[app integration and console result](https://github.com/spyro-98/VitaMediaDeck/blob/feature/iptv/docs/iptv-hw-startup-2026-10-27.md).
+
 The standalone builder instead pins FFmpeg 8.1.2; do not confuse that prefix
 with the archive linked by the app.
 

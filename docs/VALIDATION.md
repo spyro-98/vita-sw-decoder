@@ -39,6 +39,18 @@ MP4/MKV duration, selected-track timing, subtitle seek scheduling and frozen-fra
 restart ownership. Host HW tests substitute SceVideodec and cannot establish
 real Vita decoder compatibility, AudioOut output, GXM behavior, FPS or power.
 
+## 27 October integration result
+
+VitaMediaDeck's standard 1.4.1 build at app commit `5419ffe` passed host lifecycle,
+HLS/DASH, decoder-wrapper and seek/subtitle regressions, plus native Release/LTO
+and import/license audits. The user then confirmed successful IPTV HW playback,
+including sources described as 1080p. This is integrated-app HW feedback;
+selected rendition, FPS, clocks and energy were not independently measured.
+This is not new SW playback/performance evidence. The CPU backend's
+implementation and standalone FFmpeg pin are unchanged.
+
+See the [app report](https://github.com/spyro-98/VitaMediaDeck/blob/feature/iptv/docs/iptv-hw-startup-2026-10-27.md) for the exact tested VPK hash and evidence boundaries.
+
 ## Physical acceptance
 
 Use legally available known files and report commit, FFmpeg prefix/version,

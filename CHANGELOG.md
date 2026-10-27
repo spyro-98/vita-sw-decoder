@@ -1,5 +1,17 @@
 # Change record
 
+## 2026-10-27 — Integrated IPTV HW acceptance and scope
+
+- Record user-confirmed IPTV HW playback in VitaMediaDeck 1.4.1 after app commit
+  `5419ffe`, including sources described as 1080p without asserting the selected
+  rendition's measured resolution or FPS.
+- Distinguish the app HLS timestamp fix and app-built FFmpeg hardware lifecycle
+  patch from the unchanged standalone package code, ABI and dependency pins.
+- Update app clock policy documentation: configurable HW333/SW444 defaults and
+  priority for external PSVshell control; neither decoder sets system clocks.
+- Keep the successful HW retest separate from SW throughput claims and retain
+  the existing software performance limits.
+
 ## 2026-10-23 — VitaMediaDeck 1.4.1 documentation alignment
 
 - Document current runtime/ownership/cancellation, MP4 timing and live API limits.
