@@ -62,6 +62,7 @@ typedef struct {
 	uint32_t pitch;
 	uint32_t frame_bytes;
 	uint32_t ring_memory_bytes;
+	int zero_surface_capacity;
 	int hardware_direct_available;
 	int zero_copy;
 	int hardware_runtime_ready;

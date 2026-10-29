@@ -154,6 +154,7 @@ int vita_sw_decoder_present_rect(VitaSwDecoderPlayer *player,
  * draw and exclude concurrent present/render_complete calls for this player. */
 void vita_sw_decoder_discard_video_to_clock(VitaSwDecoderPlayer *player);
 void vita_sw_decoder_render_complete(VitaSwDecoderPlayer *player);
+int vita_sw_decoder_presented_time(VitaSwDecoderPlayer *player,uint64_t *pts_us);
 void vita_sw_decoder_get_status(VitaSwDecoderPlayer *player,
 	                           VitaSwDecoderPlayerStatus *status);
 

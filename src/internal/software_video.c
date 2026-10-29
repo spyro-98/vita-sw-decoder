@@ -51,9 +51,15 @@
 #define CDRAM_ALIGNMENT                0x40000u
 #define ALIGN_UP_U32(v, a) (((v) + ((a) - 1u)) & ~((a) - 1u))
 
+static int output_surface_capacity(uint32_t width,uint32_t height){
+ return (uint64_t)width*height>1280ULL*720ULL?12:SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
+}
+static int active_surface_count(const SoftwareVideoState *st){
+ return st->zero_surface_capacity?st->zero_surface_capacity:SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
+}
 static int hardware_raster_supported(uint32_t width, uint32_t height) {
 	return width > 0 && height > 0 && width <= 1920 && height <= 1088 &&
-	       (uint64_t)width * (uint64_t)height <= 1280ULL * 720ULL;
+	       (uint64_t)width * (uint64_t)height <= 1920ULL * 1088ULL;
 }
 
 /* The old CPU zero-copy experiment remains disabled: frame-threaded libavcodec
@@ -207,7 +213,7 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 	for (;;) {
         video_wait_prepare(st);
 		if (should_stop(st)) return AVERROR_EXIT;
-		for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++) {
+		for (int i = 0; i < active_surface_count(st); i++) {
 			if (__sync_bool_compare_and_swap(&st->zero_surfaces[i].in_use, 0, 1)) {
 				surface = &st->zero_surfaces[i];
 				break;
@@ -648,7 +654,7 @@ static int open_h264_decoder(SoftwareVideoState *st, AVStream *stream,
 			decoder->opaque = st;
 			decoder->get_buffer2 = zero_copy_get_buffer2;
 			st->zero_copy = 1;
-			st->queue_capacity = SOFTWARE_VIDEO_FRAME_SLOTS;
+			st->queue_capacity = active_surface_count(st)-4;
 #else
 			decoder->pix_fmt = AV_PIX_FMT_YUV420P;
 #endif
@@ -901,16 +907,17 @@ static int allocate_copy_ring(SoftwareVideoState *st) {
 		if (!st->slots[i].pixels) return AVERROR(ENOMEM);
 	}
     st->ring_memory_bytes=st->slots[0].allocation_size*SOFTWARE_VIDEO_COPY_FRAME_SLOTS;
-    if(st->hardware_direct_available)st->ring_memory_bytes+=st->zero_surfaces[0].allocation_size*SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
+    if(st->hardware_direct_available)st->ring_memory_bytes+=st->zero_surfaces[0].allocation_size*active_surface_count(st);
 	return 0;
 }
 
 static __attribute__((unused)) int allocate_zero_copy_pool(SoftwareVideoState *st) {
+    st->zero_surface_capacity=output_surface_capacity(st->texture_width,st->texture_height);
 	for (int i = 0; i < SOFTWARE_VIDEO_FRAME_SLOTS; i++) {
 		st->slots[i].frame = av_frame_alloc();
 		if (!st->slots[i].frame) return AVERROR(ENOMEM);
 	}
-	for (int i = 0; i < SOFTWARE_VIDEO_ZERO_COPY_SURFACES; i++) {
+	for (int i = 0; i < active_surface_count(st); i++) {
 		char name[32];
 		snprintf(name, sizeof(name), "VitaSwDecoderZeroYuv%d", i);
 		SoftwareVideoZeroSurface *surface = &st->zero_surfaces[i];
@@ -1028,7 +1035,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 		if (buffer_ret >= 0) {
 			st->hardware_direct_available = 1;
 			st->ring_memory_bytes = st->zero_surfaces[0].allocation_size *
-			                         SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
+			                         active_surface_count(st);
 		} else {
 			/* Partial pool allocations cannot be used, but the copied ring is
 			 * independent and remains valid. */
