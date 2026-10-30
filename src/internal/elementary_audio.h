@@ -42,7 +42,7 @@ typedef struct {
 	int input_is_adts;
 	volatile int paused;       /* the caller raises/lowers it, the thread honors it */
 	volatile int stop;         /* restart only this audio pipeline */
-	volatile int volume_percent; /* shared 0..300 perceived volume */
+	volatile int volume_percent; /* shared 0..150%; atomic publication */
 	uint64_t initial_position_ms; /* progressive restart: discard earlier AUs */
 	int64_t timeline_origin_us;   /* common container origin, preserves A/V offset */
 	int port;

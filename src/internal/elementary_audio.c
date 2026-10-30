@@ -1,4 +1,5 @@
 #include "internal/elementary_audio.h"
+#include "internal/audio_gain.h"
 
 #include <malloc.h>
 #include <string.h>
@@ -102,6 +103,8 @@ static int vita_sw_elementary_audio_output_thread(SceSize args, void *argp) {
 	unsigned int output_grains = 0;
 	unsigned int delayed_output_grains = 0;
 	int last_applied_volume = -1;
+	int16_t boosted[ELEMENTARY_AUDIO_GRAIN * ELEMENTARY_AUDIO_MAX_CHANNELS]
+	    __attribute__((aligned(64)));
 	log_printf("elementary_audio: output priority=%d ring=%d",
 	           sceKernelGetThreadCurrentPriority(), ELEMENTARY_AUDIO_RING_GRAINS);
 
@@ -119,10 +122,11 @@ static int vita_sw_elementary_audio_output_thread(SceSize args, void *argp) {
 			sceKernelDelayThread(1000);
 			continue;
 		}
-		int requested_volume = st->volume_percent;
+		int requested_volume = vita_audio_volume_clamp(
+		    __atomic_load_n(&st->volume_percent, __ATOMIC_ACQUIRE));
 		if (requested_volume != last_applied_volume && st->port >= 0) {
 			last_applied_volume = requested_volume;
-			int hardware_percent = requested_volume > 100 ? 100 : requested_volume;
+			int hardware_percent = vita_audio_hardware_percent(requested_volume);
 			int hardware_volume = hardware_percent * SCE_AUDIO_VOLUME_0DB / 100;
 			int volume[2] = { hardware_volume, hardware_volume };
 			sceAudioOutSetVolume(st->port,
@@ -134,7 +138,15 @@ static int vita_sw_elementary_audio_output_thread(SceSize args, void *argp) {
 		int16_t *grain = st->pcm_ring +
 		                 slot * ELEMENTARY_AUDIO_GRAIN *
 		                     ELEMENTARY_AUDIO_MAX_CHANNELS;
-		int output_ret = sceAudioOutOutput(st->port, grain);
+		/* Apply the latest boost when consuming each grain, not while filling
+		 * the ring. Queued original PCM survives boost-down and mute toggles. */
+		const int16_t *output = grain;
+		if (requested_volume > 100) {
+			vita_audio_boost_pcm16(grain, boosted,
+			    ELEMENTARY_AUDIO_GRAIN * st->decoder.channels, requested_volume);
+			output = boosted;
+		}
+		int output_ret = sceAudioOutOutput(st->port, output);
 		if (output_ret < 0) {
 			log_printf("elementary_audio: sceAudioOutOutput -> 0x%08X",
 			           (unsigned)output_ret);
@@ -245,7 +257,6 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 	st->first_packet_ready = 1;
 
 	while (!*st->cancel && !st->stop) {
-		int requested_volume = st->volume_percent;
 		if (st->paused) {
 			/* Let the consumer own pause semantics; stop producing once the ring
 			 * is full so decoded PCM remains bounded and ordered. */
@@ -321,19 +332,6 @@ static int vita_sw_elementary_audio_thread(SceSize args, void *argp) {
 			          decoded.frames);
 			st->had_error = 1;
 			break;
-		}
-		/* Same 100..200% software boost as the direct player. This PCM buffer
-		 * belongs to our decoder and isn't reused until the next decode, which
-		 * happens only after all blocking AudioOut grains below have returned. */
-		if (requested_volume > 100) {
-			int16_t *pcm = (int16_t *)(uintptr_t)decoded.pcm;
-			uint32_t samples = decoded.frames * decoded.channels;
-			for (uint32_t i = 0; i < samples; i++) {
-				int32_t value = (int32_t)pcm[i] * requested_volume / 100;
-				if (value > INT16_MAX) value = INT16_MAX;
-				else if (value < INT16_MIN) value = INT16_MIN;
-				pcm[i] = (int16_t)value;
-			}
 		}
 		int64_t pts_us = pts != AV_NOPTS_VALUE
 		               ? av_rescale_q(pts, stream_tb, us_tb) -
@@ -565,7 +563,6 @@ uint64_t vita_sw_elementary_audio_clock_us(const ElementaryAudioState *st) {
 
 void vita_sw_elementary_audio_set_volume(ElementaryAudioState *st, int percent) {
 	if (!st) return;
-	if (percent < 0) percent = 0;
-	if (percent > 300) percent = 300;
-	st->volume_percent = percent;
+	__atomic_store_n(&st->volume_percent, vita_audio_volume_clamp(percent),
+	                 __ATOMIC_RELEASE);
 }

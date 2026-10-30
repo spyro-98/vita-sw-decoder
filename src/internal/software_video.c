@@ -52,7 +52,7 @@
 #define ALIGN_UP_U32(v, a) (((v) + ((a) - 1u)) & ~((a) - 1u))
 
 static int output_surface_capacity(uint32_t width,uint32_t height){
- return (uint64_t)width*height>1280ULL*720ULL?12:SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
+ return (uint64_t)width*height>1280ULL*720ULL?8:SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
 }
 static int active_surface_count(const SoftwareVideoState *st){
  return st->zero_surface_capacity?st->zero_surface_capacity:SOFTWARE_VIDEO_ZERO_COPY_SURFACES;
@@ -925,7 +925,15 @@ static __attribute__((unused)) int allocate_zero_copy_pool(SoftwareVideoState *s
 		                                            CDRAM_ALIGNMENT);
 		surface->pixels = allocate_cdram(name, st->frame_bytes,
 		                                       &surface->memblock);
-		if (!surface->pixels) return AVERROR(ENOMEM);
+		if (!surface->pixels) {
+            /* Four surfaces are reserved by the pipeline. Retain at least two
+             * queued output frames; larger queues are optional, not a reason
+             * to reject a decodable channel on a fragmented CDRAM heap. */
+            if(i<6)return AVERROR(ENOMEM);
+            st->zero_surface_capacity=i;
+            log_printf("video output pool reduced to %d surfaces after allocation pressure\n",i);
+            break;
+        }
 	}
 	/* Fail closed before FFmpeg owns a surface. Texture initialization is
 	 * metadata-only and proves that this firmware accepts direct NV12/P2. */

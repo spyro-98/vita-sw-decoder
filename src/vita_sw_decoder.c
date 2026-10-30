@@ -15,6 +15,7 @@
 
 #include "decoder_runtime.h"
 #include "internal/elementary_audio.h"
+#include "internal/audio_gain.h"
 #include "internal/software_video.h"
 #include "internal/input_timing.h"
 #include "module_log.h"
@@ -1575,8 +1576,7 @@ static int decoder_open_mode(VitaSwDecoderPlayer *player,
 	player->live_audio_channels = live ? audio_channels : 0;
 	player->config = *config;
 	if (player->config.audio_track < 0) player->config.audio_track = 0;
-	if (player->config.volume_percent < 0) player->config.volume_percent = 0;
-	if (player->config.volume_percent > 300) player->config.volume_percent = 300;
+	player->config.volume_percent = vita_audio_volume_clamp(player->config.volume_percent);
 	player->paused = config->start_paused != 0;
 	/* A newly opening session has never published a texture. Failure cleanup is
 	 * therefore already GPU-safe and must not call vita2d from this worker. */
@@ -1626,8 +1626,7 @@ void vita_sw_decoder_set_paused(VitaSwDecoderPlayer *player, int paused) {
 
 void vita_sw_decoder_set_volume(VitaSwDecoderPlayer *player, int percent) {
 	if (!player) return;
-	if (percent < 0) percent = 0;
-	if (percent > 300) percent = 300;
+	percent = vita_audio_volume_clamp(percent);
 	player->config.volume_percent = percent;
 	vita_sw_elementary_audio_set_volume(&player->audio, percent);
 }

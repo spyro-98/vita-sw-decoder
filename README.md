@@ -292,3 +292,12 @@ FFmpeg static archives, license text and corresponding source.
 
 Licensed GPL-3.0-only. See `THIRD_PARTY_NOTICES.md` for FFmpeg and VitaSDK
 requirements.
+
+### Beta integration (VitaMediaDeck 1.4.4)
+
+Volume uses 0–100% for normal output and 100–150% for PCM boost, clamped at 150%.
+AAC queue samples stay unmodified; the output consumer applies the current gain
+and saturates boosted samples. The Full HD direct-output pool uses eight
+surfaces and can retain a smaller queue under allocation pressure when at least
+six surfaces were allocated. Host lifecycle checks do not establish console
+playback performance or the cause of a system reset.

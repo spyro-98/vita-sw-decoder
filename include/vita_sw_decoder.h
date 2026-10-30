@@ -60,7 +60,7 @@ typedef struct VitaSwDecoderPlayerConfig {
 	uint32_t expected_height;
 	int expected_fps;
 	uint64_t start_position_ms;
-	int volume_percent;
+	int volume_percent; /* 0..100 normal (100 = unity), 100..150 PCM boost; clamped. */
 	/* Optional cooperative cancellation flag used during remote opens and
 	 * decode. The caller must keep it alive until close returns. */
 	volatile int *cancel_flag;
